@@ -1,0 +1,66 @@
+# =============================================================================
+# Oracle Free Tier - OpenProject + Mattermost - Git Ignore
+# =============================================================================
+
+# Environment files (CONTÉM SECRETS - NUNCA COMMITAR)
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+!.env.example
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.rc
+
+# Docker
+docker/.env
+docker/certbot_www/*
+docker/nginx/ssl/*.key
+docker/nginx/ssl/*.pem
+docker/nginx/ssl/*.crt
+!docker/nginx/ssl/.gitkeep
+
+# Scripts
+scripts/*.log
+
+# Backups
+backups/
+*.sql.gz
+*.tar.gz
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
+!ssh/*.pub
+
+# Oracle Cloud
+.oci/
+oci_config
+oci_api_key.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db

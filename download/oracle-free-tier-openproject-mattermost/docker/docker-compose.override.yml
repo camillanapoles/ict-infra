@@ -1,0 +1,115 @@
+# =============================================================================
+# Docker Compose Override - Desenvolvimento / Debug
+# =============================================================================
+# ATENÇÃO: Este arquivo é carregado automaticamente pelo Docker Compose.
+# Para usar em produção, execute: docker compose -f docker-compose.yml up -d
+# Ou renomeie este arquivo para .bak antes de fazer deploy.
+# =============================================================================
+
+services:
+
+  # --- PostgreSQL: limites reduzidos para desenvolvimento ---
+  postgresql:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "0.5"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    ports:
+      - "5432:5432"
+    command: >
+      postgres
+      -c log_statement=all
+      -c log_duration=on
+      -c log_min_duration_statement=0
+
+  # --- Memcached: limites reduzidos ---
+  memcached:
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.1"
+
+  # --- OpenProject: limites reduzidos, debug ativado ---
+  openproject:
+    environment:
+      OPENPROJECT_RAILS__LOG__LEVEL: debug
+      OPENPROJECT_LOG__LEVEL: debug
+      RAILS_ENV: development
+      OPENPROJECT_CACHE__STORE: null
+      OPENPROJECT_RAILS__CACHE__STORE: null
+    ports:
+      - "8080:80"
+      - "3000:3000"   # Porta de debug adicional
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+
+  # --- Mattermost: limites reduzidos, verbose ---
+  mattermost:
+    environment:
+      MM_LOGSETTINGS_CONSOLELEVEL: DEBUG
+      MM_LOGSETTINGS_FILELEVEL: DEBUG
+      MM_SERVICESETTINGS_ENABLEDEVELOPER: "true"
+      MM_SERVICESETTINGS_ENABLETESTING: "true"
+    ports:
+      - "8065:8065"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "0.25"
+        reservations:
+          memory: 256M
+          cpus: "0.1"
+
+  # --- Nginx: logs verbose em dev ---
+  nginx:
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/logs:/var/log/nginx              # Logs acessíveis localmente
+      - certbot_conf:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    ports:
+      - "80:80"
+      # - "443:443"   # Comentar em dev se não tiver certificados locais
+
+  # --- Certbot: desativado em dev ---
+  certbot:
+    profiles: []    # Removido dos perfis para não iniciar automaticamente
+    entrypoint: ["echo", "[dev] Certbot desativado no ambiente de desenvolvimento"]
+
+  # --- Healthcheck: intervalo mais curto em dev ---
+  healthcheck:
+    entrypoint: >
+      /bin/sh -c '
+      echo "[healthcheck-dev] Modo verbose ativado - verificando a cada 15s";
+      while true; do
+        echo "";
+        echo "=== $$(date +%H:%M:%S) ===";
+
+        OPENPROJECT_STATUS=$$(curl -sf --max-time 5 http://openproject:80/health 2>&1 || echo "FALHOU");
+        echo "[OpenProject] $${OPENPROJECT_STATUS}";
+
+        MATTERMOST_STATUS=$$(curl -sf --max-time 5 http://mattermost:8065/api/v4/system/ping 2>&1 || echo "FALHOU");
+        echo "[Mattermost] $${MATTERMOST_STATUS}";
+
+        PG_STATUS=$$(nc -z postgresql 5432 2>/dev/null && echo "OK" || echo "FALHOU");
+        echo "[PostgreSQL] $${PG_STATUS}";
+
+        MC_STATUS=$$(nc -z memcached 11211 2>/dev/null && echo "OK" || echo "FALHOU");
+        echo "[Memcached] $${MC_STATUS}";
+
+        sleep 15;
+      done;
+      '

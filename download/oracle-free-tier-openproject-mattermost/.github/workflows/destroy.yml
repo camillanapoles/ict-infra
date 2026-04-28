@@ -1,0 +1,285 @@
+# =============================================================================
+# Infrastructure Destruction Workflow
+# Tears down ALL Oracle Cloud resources provisioned by Terraform.
+# MANUAL ONLY – requires explicit "CONFIRM-DESTROY" confirmation.
+# =============================================================================
+
+name: "Destroy Infrastructure"
+
+on:
+  # Manual trigger with mandatory confirmation
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type CONFIRM-DESTROY to proceed (exact match required)"
+        required: true
+        type: string
+      skip_backup:
+        description: "Skip database backup before destruction"
+        required: false
+        default: false
+        type: boolean
+      reason:
+        description: "Reason for destruction (for audit log)"
+        required: false
+        type: string
+
+  # Can be triggered via GitHub API / repository_dispatch
+  repository_dispatch:
+    types: [destroy-infrastructure]
+
+# Prevent simultaneous destroys and block other workflows
+concurrency:
+  group: destroy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "~1.7"
+  TF_WORKING_DIR: terraform
+  VM_USER: ubuntu
+  SSH_OPTS: >
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=30
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Confirmation gate
+  # ---------------------------------------------------------------------------
+  confirm:
+    name: "Confirm Destruction"
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify confirmation string
+        run: |
+          CONFIRMATION="${{ github.event.inputs.confirmation }}"
+          if [ "$CONFIRMATION" != "CONFIRM-DESTROY" ]; then
+            echo "::error::Confirmation string does not match."
+            echo "You must type exactly: CONFIRM-DESTROY"
+            echo "You provided: '$CONFIRMATION'"
+            exit 1
+          fi
+          echo "✅ Destruction confirmed"
+
+      - name: Log destruction request
+        run: |
+          echo "## 🗑️ Infrastructure Destruction Requested" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Initiated by** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Trigger** | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Reason** | ${{ github.event.inputs.reason || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Skip Backup** | ${{ github.event.inputs.skip_backup }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Timestamp** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Pre-destroy database backup
+  # ---------------------------------------------------------------------------
+  backup:
+    name: "Pre-Destroy Backup"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [confirm]
+    if: ${{ github.event.inputs.skip_backup != 'true' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Get VM IP from Terraform state
+        id: vm
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.TF_VAR_tenancy_ocid }}
+          TF_VAR_user_ocid: ${{ secrets.TF_VAR_user_ocid }}
+          TF_VAR_fingerprint: ${{ secrets.TF_VAR_fingerprint }}
+          TF_VAR_private_key: ${{ secrets.TF_VAR_private_key }}
+          TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_compartment_ocid }}
+          TF_VAR_region: ${{ secrets.TF_VAR_region }}
+        run: |
+          terraform init -input=false -no-color || true
+          VM_IP=$(terraform output -raw vm_public_ip 2>/dev/null || echo "")
+          echo "vm_ip=$VM_IP" >> "$GITHUB_OUTPUT"
+          if [ -z "$VM_IP" ]; then
+            echo "⚠️ Could not determine VM IP from state – backup may be skipped"
+          fi
+
+      - name: Backup databases
+        if: steps.vm.outputs.vm_ip != ''
+        timeout-minutes: 10
+        run: |
+          VM_IP="${{ steps.vm.outputs.vm_ip }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_DIR="/tmp/pre-destroy-backup"
+
+          mkdir -p "$BACKUP_DIR"
+
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s "$TIMESTAMP" << 'REMOTE_SCRIPT'
+            set -euo pipefail
+            TIMESTAMP="$1"
+            BACKUP_DIR="/tmp/pre-destroy-backup-${TIMESTAMP}"
+            mkdir -p "$BACKUP_DIR"
+
+            echo "💾 Dumping OpenProject database..."
+            docker exec $(docker compose -f /opt/app/docker-compose.yml ps -q db 2>/dev/null || echo "") \
+              pg_dump -U openproject openproject > "$BACKUP_DIR/openproject_${TIMESTAMP}.sql" 2>/dev/null || \
+              echo "⚠️ OpenProject DB dump failed or container not found"
+
+            echo "💾 Dumping Mattermost database..."
+            docker exec $(docker compose -f /opt/app/docker-compose.yml ps -q db 2>/dev/null || echo "") \
+              pg_dump -U mattermost mattermost > "$BACKUP_DIR/mattermost_${TIMESTAMP}.sql" 2>/dev/null || \
+              echo "⚠️ Mattermost DB dump failed or container not found"
+
+            echo "💾 Archiving data volumes..."
+            tar czf "$BACKUP_DIR/openproject_data_${TIMESTAMP}.tar.gz" \
+              /opt/app/openproject/data 2>/dev/null || true
+            tar czf "$BACKUP_DIR/mattermost_data_${TIMESTAMP}.tar.gz" \
+              /opt/app/mattermost/data 2>/dev/null || true
+
+            echo "✅ Backup files created:"
+            ls -lh "$BACKUP_DIR/"
+
+            REMOTE_SCRIPT
+
+      - name: Download backups locally
+        if: steps.vm.outputs.vm_ip != ''
+        run: |
+          VM_IP="${{ steps.vm.outputs.vm_ip }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          mkdir -p /tmp/local-backup
+
+          rsync -avz -e "ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key" \
+            --include='*.sql' --include='*.tar.gz' --exclude='*' \
+            ${{ env.VM_USER }}@${VM_IP}:/tmp/pre-destroy-backup-${TIMESTAMP}/ \
+            /tmp/local-backup/
+
+      - name: Upload backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-destroy-backup-$(date +%Y%m%d_%H%M%S)
+          path: /tmp/local-backup/
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Terraform Destroy
+  # ---------------------------------------------------------------------------
+  destroy:
+    name: "Terraform Destroy"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [confirm, backup]
+    if: always() && needs.confirm.result == 'success'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup OCI CLI
+        run: |
+          curl -L -o /tmp/oci-cli-install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+          bash /tmp/oci-cli-install.sh --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+          mkdir -p ~/.oci
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          tenancy=${{ secrets.TF_VAR_tenancy_ocid }}
+          user=${{ secrets.TF_VAR_user_ocid }}
+          fingerprint=${{ secrets.TF_VAR_fingerprint }}
+          region=${{ secrets.TF_VAR_region }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          echo "${{ secrets.TF_VAR_private_key }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.TF_VAR_tenancy_ocid }}
+          TF_VAR_user_ocid: ${{ secrets.TF_VAR_user_ocid }}
+          TF_VAR_fingerprint: ${{ secrets.TF_VAR_fingerprint }}
+          TF_VAR_private_key: ${{ secrets.TF_VAR_private_key }}
+          TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_compartment_ocid }}
+          TF_VAR_region: ${{ secrets.TF_VAR_region }}
+        run: |
+          terraform init \
+            -backend-config="address=oci://${TF_VAR_tenancy_ocid}/${TF_VAR_compartment_ocid}/terraform-state" \
+            -backend-config="region=${TF_VAR_region}" \
+            -input=false \
+            -no-color
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.TF_VAR_tenancy_ocid }}
+          TF_VAR_user_ocid: ${{ secrets.TF_VAR_user_ocid }}
+          TF_VAR_fingerprint: ${{ secrets.TF_VAR_fingerprint }}
+          TF_VAR_private_key: ${{ secrets.TF_VAR_private_key }}
+          TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_compartment_ocid }}
+          TF_VAR_region: ${{ secrets.TF_VAR_region }}
+          TF_VAR_ssh_public_key: ${{ secrets.TF_VAR_ssh_public_key }}
+          TF_VAR_admin_password: ${{ secrets.TF_VAR_admin_password }}
+        run: |
+          terraform destroy \
+            -auto-approve \
+            -input=false \
+            -no-color
+
+      - name: Destruction summary
+        if: always()
+        run: |
+          echo "## 🗑️ Infrastructure Destruction Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Backup:** ${{ needs.backup.result == 'success' && '✅ Created' || needs.backup.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Post-destroy notification
+  # ---------------------------------------------------------------------------
+  notify:
+    name: "Send Notification"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [destroy]
+    if: always()
+    steps:
+      - name: Send destruction notification
+        run: |
+          STATUS="${{ needs.destroy.result }}"
+          WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_URL || secrets.DEPLOY_WEBHOOK_URL }}"
+
+          if [ -n "$WEBHOOK_URL" ]; then
+            curl -sf -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "🚨 *Infrastructure DESTROYED* ($STATUS)\nRepo: `${{ github.repository }}`\nInitiated by: ${{ github.actor }}\nReason: ${{ github.event.inputs.reason || \"Manual trigger\" }}\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+              }' || true
+          fi
+
+          # Also notify via email if configured
+          if [ -n "${{ secrets.NOTIFICATION_EMAIL }}" ]; then
+            echo "Email notification configured but sending via webhook is preferred." >> $GITHUB_STEP_SUMMARY
+          fi

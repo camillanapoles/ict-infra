@@ -1,0 +1,92 @@
+# ============================================================================
+# terraform.tfvars.example - Exemplo de valores para as variaveis
+# ============================================================================
+# Copie este arquivo para terraform.tfvars e preencha com seus valores.
+# NAO commit este arquivo com valores reais no Git!
+#
+# Uso:
+#   cp terraform.tfvars.example terraform.tfvars
+#   # Edite terraform.tfvars com seus dados
+#   terraform plan -var-file="terraform.tfvars"
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Credenciais OCI (obrigatorio)
+# Obtenha em: OCI Console -> Profile -> User Settings -> API Keys
+# ----------------------------------------------------------------------------
+tenancy_ocid     = "ocid1.tenancy.oc1..aaaaaaaaEXAMPLE_TENANCY_OCID"
+user_ocid        = "ocid1.user.oc1..aaaaaaaaEXAMPLE_USER_OCID"
+fingerprint      = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+private_key_path = "~/.oci/oci_api_key.pem"
+compartment_ocid = "ocid1.compartment.oc1..aaaaaaaaEXAMPLE_COMPARTMENT_OCID"
+
+# ----------------------------------------------------------------------------
+# Regiao e Disponibilidade (obrigatorio)
+# Verifique disponibilidade de A1 Flex na sua regiao
+# Regioes BR: sa-saopaulo-1 (Sao Paulo), sa-santiago-1 (Chile)
+# ----------------------------------------------------------------------------
+region              = "sa-saopaulo-1"
+availability_domain = 1  # 1, 2 ou 3 dependendo da regiao
+
+# ----------------------------------------------------------------------------
+# Instancia Compute (valores otimizados para Free Tier)
+# ATENCAO: O Free Tier permite apenas 1 instancia A1 Flex com 4 OCPU / 24 GB
+# Modifique apenas se voce tiver capacidade extra alem do Free Tier
+# ----------------------------------------------------------------------------
+vm_display_name    = "openproject-mattermost-vm"
+vm_shape           = "VM.Standard.A1.Flex"
+vm_ocpus           = 4   # Maximo no Free Tier: 4
+vm_memory_in_gbs   = 24  # Maximo no Free Tier: 24 GB
+boot_volume_size_in_gbs  = 50  # Minimo: 47 GB
+block_volume_size_in_gbs = 150 # Para dados Docker + BD
+
+# ----------------------------------------------------------------------------
+# Acesso SSH (obrigatorio)
+# Gere uma chave com: ssh-keygen -t rsa -b 4096 -C "seu-email@example.com"
+# Cole o conteudo do arquivo .pub aqui
+# ----------------------------------------------------------------------------
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAA... sua-chave-publica-aqui"
+
+# ----------------------------------------------------------------------------
+# Senhas (obrigatorio)
+# Use uma senha forte (minimo 12 caracteres)
+# Esta senha sera usada para configuracao inicial dos servicos
+# ----------------------------------------------------------------------------
+admin_password = "SuaSenhaForteAqui123!"
+
+# ----------------------------------------------------------------------------
+# Configuracao de Rede
+# Mantenha os valores padrao a menos que tenha conflitos de rede
+# ----------------------------------------------------------------------------
+vcn_cidr           = "10.0.0.0/16"
+subnet_public_cidr = "10.0.1.0/24"
+
+# ----------------------------------------------------------------------------
+# Dominios (obrigatorio - necessario para SSL/HTTPS)
+# Certifique-se de que os DNS A records apontam para o IP da instancia
+# ou do Load Balancer apos o deploy
+# ----------------------------------------------------------------------------
+openproject_domain = "projects.example.com"
+mattermost_domain  = "chat.example.com"
+
+# ----------------------------------------------------------------------------
+# Repositorio Git (opcional)
+# URL do repositorio com os docker-compose.yml e configuracoes
+# Se vazio, o cloud-init criara uma configuracao padrao
+# ----------------------------------------------------------------------------
+git_repo_url = "https://github.com/seu-usuario/seu-repo.git"
+git_branch   = "main"
+
+# ----------------------------------------------------------------------------
+# Notificacao por Email (recomendado)
+# Receba alertas de CPU, memoria, disco e indisponibilidade
+# ----------------------------------------------------------------------------
+notification_email = "admin@example.com"
+
+# ----------------------------------------------------------------------------
+# Configuracao do Ambiente
+# ----------------------------------------------------------------------------
+environment  = "production"
+project_tag  = "Incubadora"
+enable_waf   = false  # WAF nao e Always Free
+enable_vault = true   # Vault e Always Free (150 segredos)

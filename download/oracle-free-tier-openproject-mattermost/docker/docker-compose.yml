@@ -1,0 +1,391 @@
+# =============================================================================
+# Oracle Cloud Free Tier - OpenProject + Mattermost
+# Docker Compose - Produção
+# VM: Oracle A1 Flex (4 OCPU / 24 GB RAM)
+# =============================================================================
+# Uso:
+#   cp .env.example .env && vim .env   # configure as variáveis
+#   docker compose up -d                # inicia todos os serviços
+#   docker compose logs -f              # acompanha os logs
+#
+# Para obter certificados SSL pela primeira vez:
+#   1. Comente as linhas "443:443" no nginx
+#   2. Descomente as linhas "80:80" (já estão ativas)
+#   3. docker compose up -d nginx certbot
+#   4. docker compose run --rm certbot certonly \
+#        --webroot --webroot-path /var/www/certbot \
+#        -d seu-dominio-openproject.com \
+#        -d seu-dominio-mattermost.com
+#   5. Restaure as linhas "443:443" e reinicie: docker compose up -d
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # PostgreSQL 17 - Banco de dados compartilhado
+  # ===========================================================================
+  postgresql:
+    image: postgres:17-alpine
+    container_name: postgresql
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?ERRO: POSTGRES_PASSWORD não definida no .env}
+      POSTGRES_USER: postgres
+      POSTGRES_MULTIPLE_DATABASES: openproject,mattermost
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./openproject/custom-config/init-db.sh:/docker-entrypoint-initdb.d/10-init-db.sh:ro
+    ports:
+      - "5432:5432"   # Acesso local para debug (remover em produção se desnecessário)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "1.0"
+        reservations:
+          memory: 1G
+          cpus: "0.5"
+    networks:
+      - incubadora-net
+
+  # ===========================================================================
+  # Memcached - Cache para o OpenProject
+  # ===========================================================================
+  memcached:
+    image: memcached:1.6-alpine
+    container_name: memcached
+    restart: unless-stopped
+    command: memcached -m 256 -c 1024 -u memcache -l 0.0.0.0
+    healthcheck:
+      test: ["CMD", "memcached", "-p", "11211", "localhost"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.25"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+    networks:
+      - incubadora-net
+
+  # ===========================================================================
+  # OpenProject 15 - Gestão de projetos (all-in-one)
+  # ===========================================================================
+  openproject:
+    image: openproject/openproject:15
+    container_name: openproject
+    restart: unless-stopped
+    environment:
+      # --- Configuração principal ---
+      OPENPROJECT_HOST__NAME: ${OPENPROJECT_DOMAIN:?ERRO: OPENPROJECT_DOMAIN não definida no .env}
+      OPENPROJECT_HTTPS: "true"
+      OPENPROJECT_SECRET_KEY_BASE: ${OPENPROJECT_SECRET_KEY:?ERRO: OPENPROJECT_SECRET_KEY não definida no .env}
+      OPENPROJECT_DEFAULT__LANGUAGE: pt-BR
+
+      # --- Banco de dados PostgreSQL ---
+      DATABASE_URL: postgres://openproject:${POSTGRES_PASSWORD}@postgresql:5432/openproject?pool=20
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # --- Cache com Memcached ---
+      OPENPROJECT_MEMCACHED__SERVERS: memcached:11211
+      OPENPROJECT_CACHE__STORE: memcache
+      OPENPROJECT_RAILS__CACHE__STORE: memcache
+
+      # --- Email (opcional, configurar no .env) ---
+      OPENPROJECT_EMAIL__DELIVERY__METHOD: ${OPENPROJECT_EMAIL_METHOD:-smtp}
+      OPENPROJECT_EMAIL__SMTP__ADDRESS: ${SMTP_HOST:-}
+      OPENPROJECT_EMAIL__SMTP__PORT: ${SMTP_PORT:-587}
+      OPENPROJECT_EMAIL__SMTP__USERNAME: ${SMTP_USER:-}
+      OPENPROJECT_EMAIL__SMTP__PASSWORD: ${SMTP_PASSWORD:-}
+      OPENPROJECT_EMAIL__SMTP__DOMAIN: ${SMTP_DOMAIN:-}
+      OPENPROJECT_EMAIL__SMTP__AUTHENTICATION: ${SMTP_AUTH:-login}
+      OPENPROJECT_EMAIL__SMTP__ENABLE__STARTTLS__AUTO: "true"
+
+    ports:
+      - "8080:80"
+    volumes:
+      - openproject_data:/var/openproject/assets
+      - openproject_pgdata:/var/openproject/pgdata
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      memcached:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:80/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: "1.5"
+        reservations:
+          memory: 1G
+          cpus: "0.75"
+    networks:
+      - incubadora-net
+
+  # ===========================================================================
+  # Mattermost Team Edition - Mensageria / Colaboração
+  # ===========================================================================
+  mattermost:
+    image: mattermost/mattermost-team-edition:release-10.6
+    container_name: mattermost
+    restart: unless-stopped
+    environment:
+      # --- Banco de dados ---
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgres://mattermost:${POSTGRES_PASSWORD}@postgresql:5432/mattermost?sslmode=disable&connect_timeout=10
+
+      # --- URL e escuta ---
+      MM_SERVICESETTINGS_SITEURL: https://${MATTERMOST_DOMAIN:?ERRO: MATTERMOST_DOMAIN não definida no .env}
+      MM_SERVICESETTINGS_LISTENADDRESS: ":8065"
+
+      # --- Email ---
+      MM_EMAILSETTINGS_ENABLESMTP: ${MM_ENABLE_SMTP:-true}
+      MM_EMAILSETTINGS_SMTPSERVER: ${SMTP_HOST:?ERRO: SMTP_HOST não definida no .env}
+      MM_EMAILSETTINGS_SMTPPORT: ${SMTP_PORT:-587}
+      MM_EMAILSETTINGS_SMTPUSERNAME: ${SMTP_USER:-}
+      MM_EMAILSETTINGS_SMTPPASSWORD: ${SMTP_PASSWORD:-}
+
+      # --- Logs ---
+      MM_LOGSETTINGS_ENABLEFILE: "true"
+      MM_LOGSETTINGS_FILELEVEL: INFO
+      MM_LOGSETTINGS_CONSOLELEVEL: ERROR
+
+      # --- Segurança ---
+      MM_SERVICESETTINGS_ENABLEDEVELOPER: "false"
+      MM_SERVICESETTINGS_ENABLETESTING: "false"
+      MM_SERVICESETTINGS_ENABLECOMMENTS: "true"
+      MM_SERVICESETTINGS_ENABLEINVITATIONS: "true"
+
+      # --- Performance ---
+      MM_SERVICESETTINGS_MAXNOTIFICATIONS_PERCHANNEL: 100000
+      MM_SERVICESETTINGS_CHANNEL_CACHE_TIME: 300
+      MM_CLUSTERSETTINGS_ENABLE: "false"
+    ports:
+      - "8065:8065"
+    volumes:
+      - mattermost_data:/var/lib/mattermost
+      - mattermost_config:/mattermost/config
+      - mattermost_plugins:/mattermost/plugins
+      - mattermost_client_plugins:/mattermost/client/plugins
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8065/api/v4/system/ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "0.5"
+        reservations:
+          memory: 512M
+          cpus: "0.25"
+    networks:
+      - incubadora-net
+
+  # ===========================================================================
+  # Nginx - Proxy reverso + TLS
+  # ===========================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - certbot_conf:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    depends_on:
+      openproject:
+        condition: service_healthy
+      mattermost:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t && curl -f http://localhost:80/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.25"
+        reservations:
+          memory: 32M
+          cpus: "0.1"
+    networks:
+      - incubadora-net
+
+  # ===========================================================================
+  # Certbot - Renovação automática de certificados SSL (Let's Encrypt)
+  # ===========================================================================
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    volumes:
+      - certbot_conf:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    entrypoint: >
+      /bin/sh -c '
+      trap exit TERM;
+      echo "[certbot] Iniciando agente de renovação de certificados...";
+      while :; do
+        certbot renew --quiet;
+        sleep 12h & wait $${!};
+      done;
+      '
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.1"
+    networks:
+      - incubadora-net
+
+  # ===========================================================================
+  # OCI Monitoring Agent - Métricas do Oracle Cloud (opcional)
+  # ===========================================================================
+  oci-monitoring-agent:
+    image: oracle/oci-monitoring-agent:latest
+    container_name: oci-monitoring-agent
+    restart: unless-stopped
+    privileged: true
+    environment:
+      # Essas variáveis são obtidas via instance metadata no OCI
+      OCI_RESOURCE_COMPARTMENT_ID: ${OCI_COMPARTMENT_ID:-}
+      OCI_RESOURCE_ID: ${OCI_INSTANCE_ID:-}
+      OCI_TENANT_ID: ${OCI_TENANT_ID:-}
+      # A imagem do OCI Monitoring Agent obtém credenciais via IMDS automaticamente
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.25"
+    profiles:
+      - monitoring    # Inicia apenas com: docker compose --profile monitoring up -d
+    networks:
+      - incubadora-net
+
+  # ===========================================================================
+  # Healthcheck Agent - Monitoramento da saúde dos serviços
+  # ===========================================================================
+  healthcheck:
+    image: curlimages/curl:latest
+    container_name: healthcheck-agent
+    restart: unless-stopped
+    entrypoint: >
+      /bin/sh -c '
+      echo "[healthcheck] Agente de monitoramento iniciado";
+      while true; do
+        echo "--- Verificação em $$(date +%Y-%m-%d\ %H:%M:%S) ---";
+
+        # Verifica OpenProject
+        if curl -sf --max-time 10 http://openproject:80/health > /dev/null 2>&1; then
+          echo "[OK] OpenProject: saudável";
+        else
+          echo "[ERRO] OpenProject: indisponível";
+        fi;
+
+        # Verifica Mattermost
+        if curl -sf --max-time 10 http://mattermost:8065/api/v4/system/ping > /dev/null 2>&1; then
+          echo "[OK] Mattermost: saudável";
+        else
+          echo "[ERRO] Mattermost: indisponível";
+        fi;
+
+        # Verifica PostgreSQL
+        if nc -z postgresql 5432 2>/dev/null; then
+          echo "[OK] PostgreSQL: acessível";
+        else
+          echo "[ERRO] PostgreSQL: inacessível";
+        fi;
+
+        # Verifica Memcached
+        if nc -z memcached 11211 2>/dev/null; then
+          echo "[OK] Memcached: acessível";
+        else
+          echo "[ERRO] Memcached: inacessível";
+        fi;
+
+        sleep 60;
+      done;
+      '
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.1"
+    depends_on:
+      openproject:
+        condition: service_started
+      mattermost:
+        condition: service_started
+      postgresql:
+        condition: service_started
+      memcached:
+        condition: service_started
+    networks:
+      - incubadora-net
+
+# =============================================================================
+# Volumes nomeados
+# =============================================================================
+volumes:
+  # PostgreSQL
+  postgres_data:
+    driver: local
+  # OpenProject
+  openproject_data:
+    driver: local
+  openproject_pgdata:
+    driver: local
+  # Mattermost
+  mattermost_data:
+    driver: local
+  mattermost_config:
+    driver: local
+  mattermost_plugins:
+    driver: local
+  mattermost_client_plugins:
+    driver: local
+  # Certificados SSL
+  certbot_conf:
+    driver: local
+  certbot_www:
+    driver: local
+
+# =============================================================================
+# Rede personalizada
+# =============================================================================
+networks:
+  incubadora-net:
+    name: incubadora-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1

@@ -1,0 +1,332 @@
+# =============================================================================
+# Automated Backup Workflow
+# Backs up OpenProject and Mattermost databases and data volumes daily.
+# Uploads backups to OCI Object Storage (Always Free 20 GB tier).
+# =============================================================================
+
+name: "Backup"
+
+on:
+  # Run daily at 02:00 UTC
+  schedule:
+    - cron: "0 2 * * *"
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      upload_to_oci:
+        description: "Upload backups to OCI Object Storage"
+        required: false
+        default: true
+        type: boolean
+      retention_days:
+        description: "Number of days to retain backups"
+        required: false
+        default: 30
+        type: string
+
+# Only one backup at a time
+concurrency:
+  group: backup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  VM_USER: ubuntu
+  BACKUP_TIMESTAMP: ${{ github.event.inputs.timestamp || '' }}
+  DEFAULT_RETENTION_DAYS: 30
+  SSH_OPTS: >
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=15
+    -o ServerAliveInterval=30
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job: Execute backup
+  # ---------------------------------------------------------------------------
+  backup:
+    name: "Database & Volume Backup"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Setup OCI CLI
+        run: |
+          curl -L -o /tmp/oci-cli-install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+          bash /tmp/oci-cli-install.sh --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+          mkdir -p ~/.oci
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          tenancy=${{ secrets.TF_VAR_tenancy_ocid }}
+          user=${{ secrets.TF_VAR_user_ocid }}
+          fingerprint=${{ secrets.TF_VAR_fingerprint }}
+          region=${{ secrets.TF_VAR_region }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          echo "${{ secrets.TF_VAR_private_key }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+      # Retrieve VM IP from Terraform state
+      - name: Get VM public IP
+        id: vm
+        run: |
+          # Try OCI CLI first
+          VM_IP=$(
+            oci compute instance list \
+              --compartment-id "${{ secrets.TF_VAR_compartment_ocid }}" \
+              --display-name "openproject-vm" \
+              --query 'data[0]."public-ip"' \
+              --raw-output 2>/dev/null
+          ) || true
+
+          if [ -z "$VM_IP" ]; then
+            # Fallback: try from DNS
+            VM_IP=$(dig +short "${{ secrets.OPENPROJECT_DOMAIN }}" 2>/dev/null | head -1) || true
+          fi
+
+          if [ -z "$VM_IP" ]; then
+            echo "::error::Could not determine VM IP. Skipping backup."
+            echo "vm_ip=" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "vm_ip=$VM_IP" >> "$GITHUB_OUTPUT"
+          echo "✅ VM IP resolved: $VM_IP"
+
+      - name: Verify SSH connectivity
+        run: |
+          VM_IP="${{ steps.vm.outputs.vm_ip }}"
+          if ! ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+              ${{ env.VM_USER }}@${VM_IP} "echo ok" 2>/dev/null; then
+            echo "::error::Cannot SSH to VM at $VM_IP"
+            exit 1
+          fi
+
+      - name: Backup OpenProject database
+        id: backup-op
+        run: |
+          VM_IP="${{ steps.vm.outputs.vm_ip }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s << REMOTE_SCRIPT
+            set -euo pipefail
+            TIMESTAMP="$TIMESTAMP"
+            BACKUP_BASE="/var/backups/app"
+            mkdir -p "$BACKUP_BASE"
+
+            # OpenProject database
+            echo "💾 Dumping OpenProject database..."
+            docker compose -f /opt/app/docker-compose.yml exec -T db \
+              pg_dump -U openproject -F c -f "/tmp/openproject_\${TIMESTAMP}.dump" openproject \
+              2>/dev/null || \
+              docker exec \$(docker ps -q --filter name=db) \
+              pg_dump -U openproject -F c -f "/tmp/openproject_\${TIMESTAMP}.dump" openproject \
+              2>/dev/null || \
+              echo "⚠️ OpenProject DB backup failed"
+
+            if [ -f "/tmp/openproject_\${TIMESTAMP}.dump" ]; then
+              mv "/tmp/openproject_\${TIMESTAMP}.dump" "$BACKUP_BASE/"
+              echo "op_backup_file=openproject_\${TIMESTAMP}.dump" >> "$GITHUB_ENV"
+            fi
+
+            REMOTE_SCRIPT
+
+          echo "op_backup_done=true" >> "$GITHUB_OUTPUT"
+
+      - name: Backup Mattermost database
+        id: backup-mm
+        run: |
+          VM_IP="${{ steps.vm.outputs.vm_ip }}"
+
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s << REMOTE_SCRIPT
+            set -euo pipefail
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            BACKUP_BASE="/var/backups/app"
+
+            # Mattermost database
+            echo "💾 Dumping Mattermost database..."
+            docker compose -f /opt/app/docker-compose.yml exec -T db \
+              pg_dump -U mattermost -F c -f "/tmp/mattermost_\${TIMESTAMP}.dump" mattermost \
+              2>/dev/null || \
+              docker exec \$(docker ps -q --filter name=db) \
+              pg_dump -U mattermost -F c -f "/tmp/mattermost_\${TIMESTAMP}.dump" mattermost \
+              2>/dev/null || \
+              echo "⚠️ Mattermost DB backup failed"
+
+            if [ -f "/tmp/mattermost_\${TIMESTAMP}.dump" ]; then
+              mv "/tmp/mattermost_\${TIMESTAMP}.dump" "$BACKUP_BASE/"
+              echo "mm_backup_file=mattermost_\${TIMESTAMP}.dump" >> "$GITHUB_ENV"
+            fi
+
+            REMOTE_SCRIPT
+
+          echo "mm_backup_done=true" >> "$GITHUB_OUTPUT"
+
+      - name: Backup data volumes
+        run: |
+          VM_IP="${{ steps.vm.outputs.vm_ip }}"
+
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s << REMOTE_SCRIPT
+            set -euo pipefail
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            BACKUP_BASE="/var/backups/app"
+            mkdir -p "$BACKUP_BASE"
+
+            echo "📦 Archiving OpenProject data volume..."
+            tar czf "$BACKUP_BASE/openproject_data_\${TIMESTAMP}.tar.gz" \
+              -C /opt/app/openproject ./data 2>/dev/null || \
+              echo "⚠️ OpenProject data backup failed"
+
+            echo "📦 Archiving Mattermost data volume..."
+            tar czf "$BACKUP_BASE/mattermost_data_\${TIMESTAMP}.tar.gz" \
+              -C /opt/app/mattermost ./data ./config 2>/dev/null || \
+              echo "⚠️ Mattermost data backup failed"
+
+            echo "📁 Backup contents:"
+            ls -lh "$BACKUP_BASE/" | tail -n +2
+
+            REMOTE_SCRIPT
+
+      - name: Upload backups to OCI Object Storage
+        if: ${{ github.event.inputs.upload_to_oci != 'false' }}
+        continue-on-error: true
+        run: |
+          VM_IP="${{ steps.vm.outputs.vm_ip }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BUCKET_NAME="app-backups"
+          NAMESPACE=$(
+            oci os namespace get --query 'data' --raw-output 2>/dev/null
+          )
+
+          # Ensure bucket exists (Always Free tier: 20 GB)
+          oci os bucket create \
+            --compartment-id "${{ secrets.TF_VAR_compartment_ocid }}" \
+            --name "$BUCKET_NAME" \
+            --storage-tier "Standard" \
+            --public-access-type "NoPublicAccess" \
+            2>/dev/null || true
+
+          # Download backups from VM to runner
+          mkdir -p /tmp/oci-backup-upload
+          rsync -avz -e "ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key" \
+            ${{ env.VM_USER }}@${VM_IP}:/var/backups/app/ \
+            /tmp/oci-backup-upload/
+
+          # Upload each backup file to OCI Object Storage
+          for file in /tmp/oci-backup-upload/*; do
+            if [ -f "$file" ]; then
+              FILENAME=$(basename "$file")
+              oci os object put \
+                --bucket-name "$BUCKET_NAME" \
+                --namespace "$NAMESPACE" \
+                --file "$file" \
+                --name "daily/${TIMESTAMP}/${FILENAME}" \
+                --no-retry 2>/dev/null || true
+              echo "📤 Uploaded: $FILENAME"
+            fi
+          done
+
+          echo "✅ Backup files uploaded to OCI Object Storage"
+
+      - name: Cleanup old local backups on VM
+        run: |
+          VM_IP="${{ steps.vm.outputs.vm_ip }}"
+          RETENTION="${{ github.event.inputs.retention_days || env.DEFAULT_RETENTION_DAYS }}"
+
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s "$RETENTION" << 'REMOTE_SCRIPT'
+            RETENTION_DAYS="$1"
+            BACKUP_BASE="/var/backups/app"
+            echo "🧹 Cleaning up backups older than ${RETENTION_DAYS} days..."
+
+            # Remove database dumps older than retention period
+            find "$BACKUP_BASE" -name "*.dump" -mtime +${RETENTION_DAYS} -delete -print 2>/dev/null || true
+            find "$BACKUP_BASE" -name "*.sql" -mtime +${RETENTION_DAYS} -delete -print 2>/dev/null || true
+            find "$BACKUP_BASE" -name "*.tar.gz" -mtime +${RETENTION_DAYS} -delete -print 2>/dev/null || true
+
+            # Report remaining
+            REMAINING=$(ls -1 "$BACKUP_BASE" 2>/dev/null | wc -l)
+            REMAINING_SIZE=$(du -sh "$BACKUP_BASE" 2>/dev/null | cut -f1)
+            echo "📊 Remaining backups: ${REMAINING} files (${REMAINING_SIZE})"
+
+            REMOTE_SCRIPT
+
+      - name: Cleanup old backups in OCI Object Storage
+        if: ${{ github.event.inputs.upload_to_oci != 'false' }}
+        continue-on-error: true
+        run: |
+          RETENTION="${{ github.event.inputs.retention_days || env.DEFAULT_RETENTION_DAYS }}"
+          BUCKET_NAME="app-backups"
+          NAMESPACE=$(oci os namespace get --query 'data' --raw-output 2>/dev/null)
+
+          # List and delete objects older than retention period
+          oci os object list \
+            --bucket-name "$BUCKET_NAME" \
+            --namespace "$NAMESPACE" \
+            --prefix "daily/" \
+            --query 'data[].name' \
+            --raw-output 2>/dev/null | while read -r obj; do
+              # Extract date from path (format: daily/YYYYMMDD_HHMMSS/filename)
+              OBJ_DATE=$(echo "$obj" | grep -oP 'daily/\K\d{8}' || true)
+              if [ -n "$OBJ_DATE" ]; then
+                OBJ_EPOCH=$(date -d "${OBJ_DATE:0:4}-${OBJ_DATE:4:2}-${OBJ_DATE:6:2}" +%s 2>/dev/null || echo 0)
+                CUTOFF=$(date -d "${RETENTION} days ago" +%s)
+                if [ "$OBJ_EPOCH" -lt "$CUTOFF" ] && [ "$OBJ_EPOCH" -gt 0 ]; then
+                  echo "🗑️ Deleting old object: $obj"
+                  oci os object delete \
+                    --bucket-name "$BUCKET_NAME" \
+                    --namespace "$NAMESPACE" \
+                    --object-name "$obj" \
+                    --force 2>/dev/null || true
+                fi
+              fi
+            done
+
+          echo "✅ OCI Object Storage cleanup complete"
+
+      - name: Generate backup summary
+        if: always()
+        run: |
+          echo "## 💾 Backup Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| VM Connectivity | ${{ steps.vm.outputs.vm_ip != '' && '✅ Connected' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OpenProject DB | ${{ steps.backup-op.result == 'success' && '✅ Backed up' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Mattermost DB | ${{ steps.backup-mm.result == 'success' && '✅ Backed up' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Data Volumes | ${{ job.status == 'success' && '✅ Archived' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OCI Upload | ${{ job.status == 'success' && '✅ Uploaded' || '⚠️ Check logs' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Old Cleanup | ✅ Done |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')  " >> $GITHUB_STEP_SUMMARY
+          echo "**Retention:** ${{ github.event.inputs.retention_days || env.DEFAULT_RETENTION_DAYS }} days" >> $GITHUB_STEP_SUMMARY
+
+      - name: Send backup notification
+        if: always()
+        continue-on-error: true
+        run: |
+          STATUS="${{ job.status }}"
+          WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_URL || secrets.DEPLOY_WEBHOOK_URL }}"
+          if [ -n "$WEBHOOK_URL" ]; then
+            curl -sf -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "💾 *Backup* completed with status: '"${STATUS}"'\nRepo: `${{ github.repository }}`\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+              }' || true
+          fi

@@ -1,0 +1,772 @@
+#cloud-config
+# ============================================================================
+# cloud-init.yaml - Provisionamento automatico da instancia
+# ============================================================================
+# Este arquivo e executado na primeira inicializacao da instancia Ubuntu.
+# Realiza toda a configuracao necessaria:
+# 1. Instalacao de dependencias (Docker, Nginx, Certbot, etc.)
+# 2. Configuracao de diretorios e volumes
+# 3. Setup do Nginx como reverse proxy com SSL
+# 4. Deploy do Docker Compose (OpenProject + Mattermost)
+# 5. Configuracao de backups automaticos
+# ============================================================================
+
+---
+# ----------------------------------------------------------------------------
+# Configuracao basica do sistema
+# ----------------------------------------------------------------------------
+hostname: incubadora
+manage_etc_hosts: true
+
+# Locale e timezone
+locale: pt_BR.UTF-8
+timezone: America/Sao_Paulo
+
+# ----------------------------------------------------------------------------
+# Usuarios
+# ----------------------------------------------------------------------------
+users:
+  - name: ubuntu
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+# ----------------------------------------------------------------------------
+# Escrita de arquivos
+# ----------------------------------------------------------------------------
+write_files:
+  # ---- Variaveis de ambiente para a aplicacao ----
+  - path: /opt/app/.env
+    permissions: '0600'
+    owner: root:root
+    content: |
+      # ============================================================
+      # Variaveis de ambiente - OpenProject + Mattermost
+      # Gerado automaticamente por Terraform/cloud-init
+      # ============================================================
+      
+      # ---- Gerais ----
+      ENVIRONMENT=${environment}
+      REGION=${region}
+      OPENPROJECT_DOMAIN=${openproject_domain}
+      MATTERMOST_DOMAIN=${mattermost_domain}
+      ADMIN_PASSWORD=${admin_password}
+      
+      # ---- OpenProject ----
+      OPENPROJECT_HOST=${openproject_domain}
+      OPENPROJECT_HTTPS=true
+      OPENPROJECT_PORT=8080
+      
+      # ---- Mattermost ----
+      MATTERMOST_HOST=${mattermost_domain}
+      MATTERMOST_HTTPS=true
+      MATTERMOST_PORT=8065
+      MATTERMOST_DB_HOST=postgres
+      MATTERMOST_DB_PORT=5432
+      MATTERMOST_DB_NAME=mattermost
+      MATTERMOST_DB_USER=mmuser
+      
+      # ---- PostgreSQL ----
+      POSTGRES_HOST=postgres
+      POSTGRES_PORT=5432
+      POSTGRES_MULTIPLE_DATABASES=openproject,mattermost
+      POSTGRES_USER=opuser
+      POSTGRES_PASSWORD=dbpassword_change_me
+
+  # ---- Docker Compose principal ----
+  - path: /opt/app/docker-compose.yml
+    permissions: '0644'
+    owner: root:root
+    content: |
+      version: "3.8"
+      
+      x-common-env: &common-env
+        TZ: America/Sao_Paulo
+      
+      services:
+        # ================================================================
+        # PostgreSQL - Banco de dados compartilhado
+        # ================================================================
+        postgres:
+          image: postgres:15-alpine
+          container_name: postgres
+          restart: unless-stopped
+          environment:
+            <<: *common-env
+            POSTGRES_USER: ${POSTGRES_USER:-opuser}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+            POSTGRES_DB: openproject
+            POSTGRES_MULTIPLE_DATABASES: openproject,mattermost
+          volumes:
+            - postgres_data:/var/lib/postgresql/data
+            - ./init-db:/docker-entrypoint-initdb.d
+          ports:
+            - "127.0.0.1:5432:5432"
+          healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opuser}"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+          networks:
+            - app-network
+        
+        # ================================================================
+        # OpenProject - Gerenciamento de Projetos
+        # ================================================================
+        openproject:
+          image: openproject/community:latest
+          container_name: openproject
+          restart: unless-stopped
+          environment:
+            <<: *common-env
+            OPENPROJECT_HOST__NAME: ${OPENPROJECT_DOMAIN:-projects.example.com}
+            OPENPROJECT_HTTPS: "true"
+            OPENPROJECT_DEFAULT__LANGUAGE: pt
+            OPENPROJECT_SECRET_KEY_BASE: ${ADMIN_PASSWORD:-changeme}
+          volumes:
+            - openproject_data:/var/openproject/assets
+            - openproject_pgdata:/var/openproject/pgdata
+            - openproject_conf:/etc/openproject
+          ports:
+            - "127.0.0.1:8080:8080"
+          depends_on:
+            postgres:
+              condition: service_healthy
+          healthcheck:
+            test: ["CMD", "curl", "-f", "http://localhost:8080/health_check"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 120s
+          networks:
+            - app-network
+        
+        # ================================================================
+        # Mattermost - Mensageria da Equipe
+        # ================================================================
+        mattermost:
+          image: mattermost/mattermost-enterprise-edition:latest
+          container_name: mattermost
+          restart: unless-stopped
+          environment:
+            <<: *common-env
+            MM_SQLSETTINGS_DRIVERNAME: postgres
+            MM_SQLSETTINGS_DATASOURCE: "postgres://${POSTGRES_USER:-opuser}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/mattermost?sslmode=disable&connect_timeout=10"
+            MM_SERVICESETTINGS_SITEURL: "https://${MATTERMOST_DOMAIN:-chat.example.com}"
+            MM_SERVICESETTINGS_LISTENADDRESS: ":8065"
+            MM_SERVICESETTINGS_ENABLECOMMANDES: "true"
+            MM_LOGSETTINGS_ENABLEFILE: "true"
+            MM_LOGSETTINGS_FILELEVEL: "INFO"
+            MM_PLUGINSETTINGS_ENABLEUPLOADS: "true"
+            MM_FILESETTINGS_MAXFILESIZE: 52428800
+          volumes:
+            - mattermost_data:/mattermost/data
+            - mattermost_plugins:/mattermost/plugins
+            - mattermost_client:/mattermost/client/plugins
+            - mattermost_config:/mattermost/config
+          ports:
+            - "127.0.0.1:8065:8065"
+          depends_on:
+            postgres:
+              condition: service_healthy
+          healthcheck:
+            test: ["CMD", "curl", "-f", "http://localhost:8065/api/v4/config"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 60s
+          networks:
+            - app-network
+      
+      volumes:
+        postgres_data:
+          driver: local
+        openproject_data:
+          driver: local
+        openproject_pgdata:
+          driver: local
+        openproject_conf:
+          driver: local
+        mattermost_data:
+          driver: local
+        mattermost_plugins:
+          driver: local
+        mattermost_client:
+          driver: local
+        mattermost_config:
+          driver: local
+      
+      networks:
+        app-network:
+          driver: bridge
+
+  # ---- Script de inicializacao do banco de dados ----
+  - path: /opt/app/init-db/create-multiple-databases.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      # Cria multiplos bancos de dados no PostgreSQL
+      set -e
+      
+      POSTGRES_USER="${POSTGRES_USER:-opuser}"
+      POSTGRES_MULTIPLE_DATABASES="${POSTGRES_MULTIPLE_DATABASES:-openproject,mattermost}"
+      
+      echo "=== Criando bancos de dados: $POSTGRES_MULTIPLE_DATABASES ==="
+      
+      for db in $(echo $POSTGRES_MULTIPLE_DATABASES | tr ',' ' '); do
+          echo "Criando banco de dados: $db"
+          psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_USER" <<-EOSQL
+              SELECT 1 FROM pg_database WHERE datname = '$db' \gexec
+              CREATE DATABASE $db WITH OWNER=$POSTGRES_USER ENCODING='UTF8';
+          EOSQL
+      done
+      
+      echo "=== Bancos de dados criados com sucesso ==="
+
+  # ---- Configuracao do Nginx (Reverse Proxy) ----
+  - path: /etc/nginx/sites-available/incubadora
+    permissions: '0644'
+    owner: root:root
+    content: |
+      # ================================================================
+      # Nginx Reverse Proxy - OpenProject + Mattermost
+      # ================================================================
+      
+      # Rate limiting
+      limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
+      limit_req_zone $binary_remote_addr zone=api:10m rate=30r/m;
+      
+      # Upstream definitions
+      upstream openproject_backend {
+          server 127.0.0.1:8080;
+          keepalive 32;
+      }
+      
+      upstream mattermost_backend {
+          server 127.0.0.1:8065;
+          keepalive 32;
+      }
+      
+      # ---- HTTP -> HTTPS Redirect + Certbot ----
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          server_name _;
+          
+          # Certbot challenge
+          location /.well-known/acme-challenge/ {
+              root /var/www/certbot;
+              allow all;
+          }
+          
+          # Redirect to HTTPS
+          location / {
+              return 301 https://$host$request_uri;
+          }
+      }
+      
+      # ---- OpenProject (HTTPS) ----
+      server {
+          listen 443 ssl http2;
+          listen [::]:443 ssl http2;
+          server_name ${openproject_domain};
+          
+          # SSL certificates (certbot)
+          ssl_certificate     /etc/letsencrypt/live/${openproject_domain}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/${openproject_domain}/privkey.pem;
+          
+          # SSL settings
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_ciphers HIGH:!aNULL:!MD5;
+          ssl_prefer_server_ciphers on;
+          ssl_session_cache shared:SSL:10m;
+          ssl_session_timeout 10m;
+          ssl_session_tickets off;
+          
+          # Security headers
+          add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+          add_header X-Frame-Options "SAMEORIGIN" always;
+          add_header X-Content-Type-Options "nosniff" always;
+          add_header X-XSS-Protection "1; mode=block" always;
+          add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+          
+          # Logging
+          access_log /var/log/nginx/openproject_access.log;
+          error_log  /var/log/nginx/openproject_error.log;
+          
+          # Proxy settings
+          location / {
+              limit_req zone=general burst=20 nodelay;
+              
+              proxy_pass http://openproject_backend;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-Server $host;
+              
+              # Timeouts
+              proxy_connect_timeout 60s;
+              proxy_send_timeout 60s;
+              proxy_read_timeout 300s;
+              
+              # Buffering
+              proxy_buffering on;
+              proxy_buffer_size 4k;
+              proxy_buffers 8 4k;
+          }
+          
+          # Max upload size para OpenProject
+          client_max_body_size 100M;
+      }
+      
+      # ---- Mattermost (HTTPS) ----
+      server {
+          listen 443 ssl http2;
+          listen [::]:443 ssl http2;
+          server_name ${mattermost_domain};
+          
+          # SSL certificates (certbot)
+          ssl_certificate     /etc/letsencrypt/live/${mattermost_domain}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/${mattermost_domain}/privkey.pem;
+          
+          # SSL settings
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_ciphers HIGH:!aNULL:!MD5;
+          ssl_prefer_server_ciphers on;
+          ssl_session_cache shared:SSL:10m;
+          ssl_session_timeout 10m;
+          ssl_session_tickets off;
+          
+          # Security headers
+          add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+          add_header X-Frame-Options "SAMEORIGIN" always;
+          add_header X-Content-Type-Options "nosniff" always;
+          
+          # Logging
+          access_log /var/log/nginx/mattermost_access.log;
+          error_log  /var/log/nginx/mattermost_error.log;
+          
+          # Mattermost WebSocket support
+          location ~ /api/v[0-9]+/(users/)?websocket$ {
+              proxy_pass http://mattermost_backend;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              
+              # WebSocket timeouts
+              proxy_read_timeout 86400s;
+              proxy_send_timeout 86400s;
+          }
+          
+          # Mattermost API
+          location /api/ {
+              limit_req zone=api burst=50 nodelay;
+              
+              proxy_pass http://mattermost_backend;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+          
+          # Mattermost static files
+          location / {
+              limit_req zone=general burst=20 nodelay;
+              
+              proxy_pass http://mattermost_backend;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+          
+          # Max upload size para Mattermost
+          client_max_body_size 50M;
+      }
+
+  # ---- Script de setup do certificado SSL ----
+  - path: /opt/app/scripts/setup-ssl.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      # Script para obter certificados SSL do Let's Encrypt
+      set -e
+      
+      DOMAINS=("${openproject_domain}" "${mattermost_domain}")
+      EMAIL="admin@${openproject_domain#*.}"
+      
+      echo "=== Configurando certificados SSL com Certbot ==="
+      
+      # Aguardar DNS propagation
+      echo "Aguardando resolucao DNS..."
+      for domain in "${DOMAINS[@]}"; do
+          for i in $(seq 1 30); do
+              if dig +short "$domain" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+                  echo "DNS resolvido: $domain"
+                  break
+              fi
+              echo "  Aguardando DNS para $domain... ($i/30)"
+              sleep 10
+          done
+      done
+      
+      # Obter certificados
+      for domain in "${DOMAINS[@]}"; do
+          echo "Obtendo certificado para: $domain"
+          certbot certonly \
+              --webroot \
+              --webroot-path=/var/www/certbot \
+              --email "$EMAIL" \
+              --agree-tos \
+              --no-eff-email \
+              --domain "$domain" \
+              --non-interactive || echo "AVISO: Nao foi possivel obter certificado para $domain"
+      done
+      
+      # Reiniciar Nginx
+      systemctl reload nginx
+      echo "=== Certificados SSL configurados ==="
+
+  # ---- Script de backup automatico ----
+  - path: /opt/app/scripts/backup.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      # Backup automatico dos dados da aplicacao
+      set -e
+      
+      BACKUP_DIR="/opt/backups"
+      DATE=$(date +%Y%m%d_%H%M%S)
+      RETENTION_DAYS=7
+      
+      mkdir -p "$BACKUP_DIR"
+      
+      echo "=== Iniciando backup em $DATE ==="
+      
+      # Backup do PostgreSQL
+      echo "Backup PostgreSQL..."
+      docker exec postgres pg_dumpall -U opuser > "$BACKUP_DIR/postgres_$DATE.sql"
+      gzip "$BACKUP_DIR/postgres_$DATE.sql"
+      
+      # Backup dos dados do OpenProject
+      echo "Backup OpenProject..."
+      docker run --rm \
+          -v openproject_data:/data \
+          -v "$BACKUP_DIR":/backup \
+          alpine tar czf "/backup/openproject_$DATE.tar.gz" -C /data .
+      
+      # Backup dos dados do Mattermost
+      echo "Backup Mattermost..."
+      docker run --rm \
+          -v mattermost_data:/data \
+          -v "$BACKUP_DIR":/backup \
+          alpine tar czf "/backup/mattermost_$DATE.tar.gz" -C /data .
+      
+      # Limpar backups antigos
+      echo "Limpando backups com mais de $RETENTION_DAYS dias..."
+      find "$BACKUP_DIR" -name "*.gz" -mtime +$RETENTION_DAYS -delete
+      
+      echo "=== Backup concluido ==="
+      echo "Arquivos: $(ls -lh $BACKUP_DIR/*_$DATE* 2>/dev/null)"
+
+  # ---- Systemd timer para backup ----
+  - path: /etc/systemd/system/incubadora-backup.timer
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Backup automatico diario - OpenProject + Mattermost
+      After=docker.service
+      
+      [Timer]
+      OnCalendar=*-*-* 02:00:00
+      Persistent=true
+      
+      [Install]
+      WantedBy=timers.target
+
+  - path: /etc/systemd/system/incubadora-backup.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Servico de backup - OpenProject + Mattermost
+      After=docker.service
+      
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/app/scripts/backup.sh
+      User=root
+      WorkingDirectory=/opt/app
+
+# ----------------------------------------------------------------------------
+# Comandos de execucao (runcmd)
+# Executados na ordem, apos a configuracao de usuarios e arquivos
+# ----------------------------------------------------------------------------
+runcmd:
+  # ================================================================
+  # ETAPA 1: Atualizacao do sistema
+  # ================================================================
+  - echo "=== ETAPA 1: Atualizando sistema ==="
+  - apt-get update -y
+  - DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+  - apt-get autoremove -y
+
+  # ================================================================
+  # ETAPA 2: Instalacao de dependencias
+  # ================================================================
+  - echo "=== ETAPA 2: Instalando dependencias ==="
+  - |
+    apt-get install -y --no-install-recommends \
+      apt-transport-https \
+      ca-certificates \
+      curl \
+      gnupg \
+      lsb-release \
+      software-properties-common \
+      nginx \
+      certbot \
+      python3-certbot-nginx \
+      python3-pip \
+      jq \
+      git \
+      htop \
+      iotop \
+      nethogs \
+      sysstat \
+      tree \
+      unzip \
+      wget \
+      chrony
+
+  # ================================================================
+  # ETAPA 3: Instalacao do Docker
+  # ================================================================
+  - echo "=== ETAPA 3: Instalando Docker ==="
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  - chmod a+r /etc/apt/keyrings/docker.gpg
+  - |
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update -y
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable docker
+  - systemctl start docker
+  - usermod -aG docker ubuntu
+
+  # ================================================================
+  # ETAPA 4: Configuracao de diretorios
+  # ================================================================
+  - echo "=== ETAPA 4: Configurando diretorios ==="
+  - mkdir -p /opt/app/init-db
+  - mkdir -p /opt/app/scripts
+  - mkdir -p /opt/backups
+  - mkdir -p /var/www/certbot
+  - mkdir -p /var/log/nginx
+  - chown -R ubuntu:ubuntu /opt/app
+  - chown -R ubuntu:ubuntu /opt/backups
+  - chmod +x /opt/app/scripts/*.sh
+  - chmod +x /opt/app/init-db/*.sh
+
+  # ================================================================
+  # ETAPA 5: Clonar repositorio Git (se configurado)
+  # ================================================================
+  - echo "=== ETAPA 5: Repositorio Git ==="
+  - |
+    if [ -n "${git_repo_url}" ] && [ "${git_repo_url}" != "" ]; then
+      echo "Clonando repositorio: ${git_repo_url}"
+      cd /opt/app
+      git clone --branch ${git_branch} ${git_repo_url} /opt/app/repo 2>/dev/null || echo "Aviso: Nao foi possivel clonar o repositorio. Usando configuracao padrao."
+      if [ -d /opt/app/repo ]; then
+        # Copiar arquivos do repo se existirem
+        [ -f /opt/app/repo/docker-compose.yml ] && cp /opt/app/repo/docker-compose.yml /opt/app/docker-compose.yml
+        [ -f /opt/app/repo/.env ] && cp /opt/app/repo/.env /opt/app/.env.example
+      fi
+    else
+      echo "Nenhum repositorio Git configurado. Usando configuracao padrao."
+    fi
+
+  # ================================================================
+  # ETAPA 6: Configuracao do Nginx
+  # ================================================================
+  - echo "=== ETAPA 6: Configurando Nginx ==="
+  - rm -f /etc/nginx/sites-enabled/default
+  - ln -sf /etc/nginx/sites-available/incubadora /etc/nginx/sites-enabled/incubadora
+  - nginx -t || echo "AVISO: Configuracao do Nginx tem erros - SSL ainda nao configurado"
+  - |
+    # Criar configuracao temporaria sem SSL para que o Nginx possa iniciar
+    # Isso permite que o certbot funcione
+    if ! nginx -t 2>/dev/null; then
+      echo "Criando configuracao temporaria do Nginx (sem SSL)..."
+      cat > /etc/nginx/sites-available/incubadora << 'NGINX_TEMP'
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          server_name _;
+          
+          location /.well-known/acme-challenge/ {
+              root /var/www/certbot;
+              allow all;
+          }
+          
+          location / {
+              return 200 'Servidor em configuracao. Aguardando certificados SSL...';
+              add_header Content-Type text/plain;
+          }
+      }
+      NGINX_TEMP
+      ln -sf /etc/nginx/sites-available/incubadora /etc/nginx/sites-enabled/incubadora
+    fi
+  - systemctl enable nginx
+  - systemctl start nginx
+
+  # ================================================================
+  # ETAPA 7: Configuracao de swap (complementa a RAM)
+  # ================================================================
+  - echo "=== ETAPA 7: Configurando swap ==="
+  - fallocate -l 4G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - |
+    if ! grep -q '/swapfile' /etc/fstab; then
+      echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+  - sysctl vm.swappiness=10
+
+  # ================================================================
+  # ETAPA 8: Configuracao do kernel para producao
+  # ================================================================
+  - echo "=== ETAPA 8: Ajustando kernel ==="
+  - |
+    cat >> /etc/sysctl.conf << 'SYSCTL'
+    # Ajustes para producao
+    net.core.somaxconn = 1024
+    net.ipv4.tcp_max_syn_backlog = 1024
+    net.ipv4.ip_local_port_range = 1024 65535
+    vm.overcommit_memory = 1
+    fs.file-max = 2097152
+    fs.inotify.max_user_watches = 524288
+    SYSCTL
+  - sysctl -p
+
+  # ================================================================
+  # ETAPA 9: Iniciar o Docker Compose
+  # ================================================================
+  - echo "=== ETAPA 9: Iniciando Docker Compose ==="
+  - cd /opt/app
+  - |
+    # Tente usar docker compose (plugin), fallback para docker-compose (standalone)
+    if docker compose version &>/dev/null; then
+      docker compose pull
+      docker compose up -d
+    else
+      echo "AVISO: docker compose plugin nao encontrado. Tentando docker-compose..."
+      curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+      chmod +x /usr/local/bin/docker-compose
+      docker-compose pull
+      docker-compose up -d
+    fi
+
+  # ================================================================
+  # ETAPA 10: Configurar backup automatico
+  # ================================================================
+  - echo "=== ETAPA 10: Configurando backup ==="
+  - systemctl daemon-reload
+  - systemctl enable incubadora-backup.timer
+  - systemctl start incubadora-backup.timer
+
+  # ================================================================
+  # ETAPA 11: Tentar obter certificados SSL
+  # ================================================================
+  - echo "=== ETAPA 11: Configurando SSL ==="
+  - |
+    # Tentar obter certificados em background
+    # (pode falhar se DNS ainda nao esta configurado)
+    (
+      sleep 60  # Aguardar servicos subirem
+      /opt/app/scripts/setup-ssl.sh 2>&1 || echo "AVISO: Certbot falhou. Execute manualmente: /opt/app/scripts/setup-ssl.sh"
+      
+      # Se obteve certificados, restaurar configuracao completa do Nginx
+      if [ -f "/etc/letsencrypt/live/${openproject_domain}/fullchain.pem" ]; then
+        echo "Certificados obtidos! Restaurando configuracao completa do Nginx..."
+        # A configuracao com SSL ja esta no lugar via write_files
+        nginx -t && systemctl reload nginx
+      fi
+    ) &
+
+  # ================================================================
+  # ETAPA 12: Configuracao do firewall (UFW)
+  # ================================================================
+  - echo "=== ETAPA 12: Configurando firewall ==="
+  - ufw --force enable
+  - ufw allow 22/tcp    # SSH
+  - ufw allow 80/tcp    # HTTP
+  - ufw allow 443/tcp   # HTTPS
+  - ufw allow from 10.0.0.0/16 to any port 5432  # PostgreSQL VCN
+  - ufw allow from 10.0.0.0/16 to any port 8080  # OpenProject VCN
+  - ufw allow from 10.0.0.0/16 to any port 8065  # Mattermost VCN
+
+  # ================================================================
+  # FINAL: Resumo do provisionamento
+  # ================================================================
+  - echo "=== PROVISIONAMENTO CONCLUIDO ==="
+  - |
+    echo "============================================================"
+    echo "  OpenProject + Mattermost - Provisionado com sucesso"
+    echo "============================================================"
+    echo ""
+    echo "  Servicos em execucao:"
+    echo "    - PostgreSQL: 127.0.0.1:5432"
+    echo "    - OpenProject: 127.0.0.1:8080"
+    echo "    - Mattermost:  127.0.0.1:8065"
+    echo "    - Nginx:       :80/:443"
+    echo ""
+    echo "  Proximos passos:"
+    echo "    1. Configure os DNS records:"
+    echo "       ${openproject_domain} -> IP_PUBLICO"
+    echo "       ${mattermost_domain} -> IP_PUBLICO"
+    echo "    2. Execute o script de SSL:"
+    echo "       /opt/app/scripts/setup-ssl.sh"
+    echo "    3. Acesse:"
+    echo "       https://${openproject_domain}"
+    echo "       https://${mattermost_domain}"
+    echo ""
+    echo "  Backup automatico: 02:00 AM (diario)"
+    echo "  Log do backup: journalctl -u incubadora-backup.service"
+    echo "============================================================"
+
+# ----------------------------------------------------------------------------
+# Final message exibido no console da instancia
+# ----------------------------------------------------------------------------
+final_message: |
+  ============================================
+  Provisionamento concluido em $UPTIME segundos
+  ============================================
+  OpenProject: https://${openproject_domain}
+  Mattermost:  https://${mattermost_domain}
+  SSH:         ssh ubuntu@$(hostname -I | awk '{print $1}')
+  ============================================

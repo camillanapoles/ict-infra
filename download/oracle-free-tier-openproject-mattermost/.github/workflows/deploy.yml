@@ -1,0 +1,468 @@
+# =============================================================================
+# Main Deployment Workflow
+# Provisions Oracle Cloud infrastructure via Terraform and deploys
+# OpenProject + Mattermost via Docker Compose on the provisioned VM.
+# =============================================================================
+
+name: "Deploy"
+
+on:
+  # Automatically deploy when validate passes on main
+  push:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - "docker/**"
+      - "scripts/**"
+      - ".github/workflows/deploy.yml"
+
+  # Manual trigger with configurable inputs
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: "production"
+        type: choice
+        options:
+          - production
+          - staging
+      destroy_on_failure:
+        description: "Destroy resources if deployment fails"
+        required: false
+        default: false
+        type: boolean
+      skip_terraform:
+        description: "Skip Terraform (infrastructure already exists)"
+        required: false
+        default: false
+        type: boolean
+
+# Only one deploy at a time; in-progress runs cancel new ones in the same env
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'production' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+
+env:
+  TF_VERSION: "~1.7"
+  TF_WORKING_DIR: terraform
+  REMOTE_APP_DIR: /opt/app
+  VM_USER: ubuntu
+  SSH_OPTS: >
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=30
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Validate that required secrets are configured
+  # ---------------------------------------------------------------------------
+  verify-secrets:
+    name: "Verify Secrets"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check required secrets
+        env:
+          REQUIRED_SECRETS: >-
+            TF_VAR_tenancy_ocid,TF_VAR_user_ocid,TF_VAR_fingerprint,
+            TF_VAR_private_key,TF_VAR_compartment_ocid,TF_VAR_region,
+            TF_VAR_ssh_public_key,TF_VAR_admin_password,VM_SSH_PRIVATE_KEY,
+            OPENPROJECT_DOMAIN,MATTERMOST_DOMAIN
+        run: |
+          missing=()
+          IFS=',' read -ra SECRET_NAMES <<< "$REQUIRED_SECRETS"
+          for secret in "${SECRET_NAMES[@]}"; do
+            secret=$(echo "$secret" | xargs) # trim whitespace
+            val="${!secret}"
+            if [ -z "$val" ]; then
+              missing+=("$secret")
+            fi
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "❌ Missing required secrets:"
+            printf '  - %s\n' "${missing[@]}"
+            echo ""
+            echo "Please configure these secrets in Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          echo "✅ All required secrets are configured"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Terraform infrastructure provisioning
+  # ---------------------------------------------------------------------------
+  terraform:
+    name: "Terraform Apply"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [verify-secrets]
+    if: ${{ github.event.inputs.skip_terraform != 'true' }}
+    outputs:
+      vm_public_ip: ${{ steps.outputs.outputs.vm_public_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup OCI CLI
+        run: |
+          # Install OCI CLI
+          curl -L -o /tmp/oci-cli-install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+          bash /tmp/oci-cli-install.sh --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+          # Configure OCI CLI from secrets
+          mkdir -p ~/.oci
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          tenancy=${{ secrets.TF_VAR_tenancy_ocid }}
+          user=${{ secrets.TF_VAR_user_ocid }}
+          fingerprint=${{ secrets.TF_VAR_fingerprint }}
+          region=${{ secrets.TF_VAR_region }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+
+          # Write API private key
+          echo "${{ secrets.TF_VAR_private_key }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.TF_VAR_tenancy_ocid }}
+          TF_VAR_user_ocid: ${{ secrets.TF_VAR_user_ocid }}
+          TF_VAR_fingerprint: ${{ secrets.TF_VAR_fingerprint }}
+          TF_VAR_private_key: ${{ secrets.TF_VAR_private_key }}
+          TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_compartment_ocid }}
+          TF_VAR_region: ${{ secrets.TF_VAR_region }}
+        run: |
+          terraform init \
+            -backend-config="address=oci://${TF_VAR_tenancy_ocid}/${TF_VAR_compartment_ocid}/terraform-state" \
+            -backend-config="region=${TF_VAR_region}" \
+            -input=false \
+            -no-color
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.TF_VAR_tenancy_ocid }}
+          TF_VAR_user_ocid: ${{ secrets.TF_VAR_user_ocid }}
+          TF_VAR_fingerprint: ${{ secrets.TF_VAR_fingerprint }}
+          TF_VAR_private_key: ${{ secrets.TF_VAR_private_key }}
+          TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_compartment_ocid }}
+          TF_VAR_region: ${{ secrets.TF_VAR_region }}
+          TF_VAR_ssh_public_key: ${{ secrets.TF_VAR_ssh_public_key }}
+          TF_VAR_admin_password: ${{ secrets.TF_VAR_admin_password }}
+        run: |
+          terraform apply \
+            -auto-approve \
+            -input=false \
+            -no-color
+
+      - name: Capture Terraform Outputs
+        id: outputs
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          VM_IP=$(terraform output -raw vm_public_ip)
+          echo "vm_public_ip=$VM_IP" >> "$GITHUB_OUTPUT"
+          echo "ℹ️ VM Public IP: $VM_IP"
+
+      # If deployment fails and destroy_on_failure is enabled, tear down
+      - name: Destroy on failure
+        if: failure() && github.event.inputs.destroy_on_failure == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.TF_VAR_tenancy_ocid }}
+          TF_VAR_user_ocid: ${{ secrets.TF_VAR_user_ocid }}
+          TF_VAR_fingerprint: ${{ secrets.TF_VAR_fingerprint }}
+          TF_VAR_private_key: ${{ secrets.TF_VAR_private_key }}
+          TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_compartment_ocid }}
+          TF_VAR_region: ${{ secrets.TF_VAR_region }}
+        run: terraform destroy -auto-approve -input=false -no-color
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Deploy applications on the VM
+  # ---------------------------------------------------------------------------
+  deploy-apps:
+    name: "Deploy Applications"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [terraform]
+    if: always() && needs.terraform.result == 'success'
+    env:
+      VM_IP: ${{ needs.terraform.outputs.vm_public_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Write SSH private key for connecting to the VM
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Wait for VM SSH to become available
+        timeout-minutes: 5
+        run: |
+          echo "⏳ Waiting for VM ($VM_IP) to accept SSH connections..."
+          for i in $(seq 1 30); do
+            if ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+                ${{ env.VM_USER }}@${VM_IP} "echo ok" 2>/dev/null; then
+              echo "✅ VM is reachable via SSH (attempt $i)"
+              break
+            fi
+            echo "  Attempt $i/30 – not ready yet..."
+            sleep 10
+          done
+
+      - name: Ensure remote directories exist
+        run: |
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} \
+            "sudo mkdir -p ${{ env.REMOTE_APP_DIR }}/{openproject,mattermost,nginx,scripts} && \
+             sudo chown -R ${{ env.VM_USER }}:${{ env.VM_USER }} ${{ env.REMOTE_APP_DIR }}"
+
+      - name: Copy Docker Compose files to VM
+        run: |
+          rsync -avz -e "ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key" \
+            --chown=${{ env.VM_USER }}:${{ env.VM_USER }} \
+            ./docker/ \
+            ${{ env.VM_USER }}@${VM_IP}:${{ env.REMOTE_APP_DIR }}/
+
+          rsync -avz -e "ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key" \
+            --chown=${{ env.VM_USER }}:${{ env.VM_USER }} \
+            ./scripts/ \
+            ${{ env.VM_USER }}@${VM_IP}:${{ env.REMOTE_APP_DIR }}/scripts/
+
+      - name: Deploy services via Docker Compose
+        run: |
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s << 'REMOTE_SCRIPT'
+            set -euo pipefail
+
+            cd /opt/app
+
+            echo "📦 Pulling latest images..."
+            docker compose pull
+
+            echo "🚀 Starting services..."
+            docker compose up -d
+
+            echo "⏳ Waiting for services to become healthy..."
+            timeout=120
+            elapsed=0
+            while [ $elapsed -lt $timeout ]; do
+              unhealthy=$(docker compose ps --format json | jq -r 'select(.Health != "healthy" and .Health != null and .State == "running") | .Service')
+              if [ -z "$unhealthy" ]; then
+                echo "✅ All services are healthy"
+                break
+              fi
+              echo "  Waiting for: $unhealthy"
+              sleep 10
+              elapsed=$((elapsed + 10))
+            done
+
+            if [ $elapsed -ge $timeout ]; then
+              echo "⚠️ Some services did not become healthy within ${timeout}s"
+              docker compose ps
+            fi
+
+            REMOTE_SCRIPT
+
+      - name: Provision initial SSL certificates
+        run: |
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s << REMOTE_SCRIPT
+            set -euo pipefail
+
+            # Install certbot if not present
+            if ! command -v certbot &>/dev/null; then
+              echo "🔧 Installing certbot..."
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq certbot
+            fi
+
+            DOMAINS="${{ secrets.OPENPROJECT_DOMAIN }} ${{ secrets.MATTERMOST_DOMAIN }}"
+            for domain in $DOMAINS; do
+              if [ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
+                echo "🔐 Requesting certificate for ${domain}..."
+                sudo certbot certonly \
+                  --nginx \
+                  -d "${domain}" \
+                  --non-interactive \
+                  --agree-tos \
+                  --email "admin@${domain}" || true
+              else
+                echo "✅ Certificate already exists for ${domain}"
+              fi
+            done
+
+            # Reload nginx to pick up certificates
+            echo "🔄 Reloading nginx..."
+            if docker compose -f /opt/app/docker-compose.yml ps nginx | grep -q running; then
+              docker compose -f /opt/app/docker-compose.yml exec nginx nginx -s reload
+            else
+              sudo systemctl reload nginx 2>/dev/null || true
+            fi
+
+            REMOTE_SCRIPT
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Health checks and smoke tests
+  # ---------------------------------------------------------------------------
+  smoke-tests:
+    name: "Smoke Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [deploy-apps]
+    env:
+      VM_IP: ${{ needs.terraform.outputs.vm_public_ip }}
+    steps:
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Check OpenProject health
+        timeout-minutes: 3
+        run: |
+          echo "🏥 Checking OpenProject at https://${{ secrets.OPENPROJECT_DOMAIN }}..."
+          for i in $(seq 1 18); do
+            HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+              "https://${{ secrets.OPENPROJECT_DOMAIN }}/health" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+              echo "✅ OpenProject is healthy (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            echo "  Attempt $i/18 – HTTP $HTTP_CODE"
+            sleep 10
+          done
+          echo "❌ OpenProject health check failed"
+          exit 1
+
+      - name: Check Mattermost health
+        timeout-minutes: 3
+        run: |
+          echo "🏥 Checking Mattermost at https://${{ secrets.MATTERMOST_DOMAIN }}..."
+          for i in $(seq 1 18); do
+            HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+              "https://${{ secrets.MATTERMOST_DOMAIN }}/api/v4/system/ping" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+              echo "✅ Mattermost is healthy (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            echo "  Attempt $i/18 – HTTP $HTTP_CODE"
+            sleep 10
+          done
+          echo "❌ Mattermost health check failed"
+          exit 1
+
+      - name: Verify Docker containers are running
+        run: |
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} \
+            "docker compose -f /opt/app/docker-compose.yml ps --format table"
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Notification and GitHub deployment record
+  # ---------------------------------------------------------------------------
+  notify:
+    name: "Post-Deploy Notification"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [smoke-tests]
+    if: always()
+    steps:
+      - name: Determine deployment status
+        id: status
+        run: |
+          if [ "${{ needs.smoke-tests.result }}" == "success" ]; then
+            echo "state=success" >> "$GITHUB_OUTPUT"
+            echo "emoji=🚀" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+            echo "emoji=❌" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Deployment record
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        # Fallback: use regular token if no app configured
+
+      - name: Record deployment
+        uses: chrnorm/deployment-action@v2
+        if: success()
+        continue-on-error: true
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          environment: ${{ github.event.inputs.environment || 'production' }}
+          environment-url: https://${{ secrets.OPENPROJECT_DOMAIN }}
+          description: "Deployed commit ${{ github.sha }}"
+          log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Set deployment status
+        uses: chrnorm/deployment-status@v2
+        if: always()
+        continue-on-error: true
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          environment-url: https://${{ secrets.OPENPROJECT_DOMAIN }}
+          deployment-id: ${{ needs.smoke-tests.outputs.deployment-id }}
+          state: ${{ steps.status.outputs.state }}
+          description: "Deployment ${{ steps.status.outputs.state }}"
+
+      - name: Send webhook notification
+        if: always()
+        continue-on-error: true
+        run: |
+          STATUS="${{ steps.status.outputs.state }}"
+          WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_URL || secrets.DEPLOY_WEBHOOK_URL }}"
+          if [ -n "$WEBHOOK_URL" ]; then
+            curl -sf -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "Deployment *'${STATUS}'* for OpenProject + Mattermost\nRepo: `${{ github.repository }}`\nCommit: `${{ github.sha }}`\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+              }' || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Summary (always runs)
+  # ---------------------------------------------------------------------------
+  summary:
+    name: "Deployment Summary"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [verify-secrets, terraform, deploy-apps, smoke-tests, notify]
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Verification | ${{ needs.verify-secrets.result == 'success' && '✅ Passed' || needs.verify-secrets.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Terraform Apply | ${{ needs.terraform.result == 'success' && '✅' || needs.terraform.result == 'skipped' && '⏭️' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application Deploy | ${{ needs.deploy-apps.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests | ${{ needs.smoke-tests.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Notification | ${{ needs.notify.result == 'success' && '✅' || '⚠️' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`  " >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}  " >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment || 'production' }}" >> $GITHUB_STEP_SUMMARY
