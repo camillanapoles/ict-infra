@@ -1,0 +1,166 @@
+# =============================================================================
+# memcached.yaml - Memcached 1.6 — Namespace: incubadora-infra
+# =============================================================================
+# Deployment do Memcached com:
+# - Configuracao otimizada para ARM64
+# - Service ClusterIP para acesso interno (cross-namespace)
+# - NetworkPolicy: allow ingress from incubadora-openproject + incubadora-mattermost
+# - Resources: 512 MB RAM, 0.2 CPU limit
+#
+# CROSS-NAMESPACE ACCESS:
+#   Service FQDN: memcached.incubadora-infra.svc.cluster.local:11211
+#   Consumers: incubadora-openproject (cache sessions/fragments)
+#               incubadora-mattermost (cache sessions/queries)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memcached
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: memcached
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: incubadora
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: memcached
+      app.kubernetes.io/component: cache
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: memcached
+        app.kubernetes.io/component: cache
+      annotations:
+        prometheus.io/scrape: "false"  # Memcached nao expoe metricas nativamente
+    spec:
+      # Garantir que rode em ARM64
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: memcached
+          image: memcached:1.6.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: memcached
+              containerPort: 11211
+              protocol: TCP
+          # Argumentos otimizados para 512 MB de RAM
+          args:
+            - "-m"              # Memoria maxima em MB
+            - "400"             # 400 MB (deixando margem)
+            - "-c"              # Maximo de conexoes simultaneas
+            - "1024"            # 1024 conexoes
+            - "-t"              # Numero de threads
+            - "2"               # 2 threads para ARM
+            - "-u"              # Rodar como usuario
+            - "memcache"
+            - "-l"              # Listen address
+            - "0.0.0.0"
+            - "-p"              # Porta
+            - "11211"
+            - "-v"              # Log level verbose (para debug)
+            - "-I"              # Tamanho maximo do item
+            - "5m"              # 5 MB por item
+            - "--conn-limit=0"  # Sem limite de conexoes por IP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "0.2"
+              memory: 512Mi
+          # Health check via check do Memcached
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "echo 'stats' | nc -w 1 localhost 11211 | grep -q 'uptime'"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "echo 'stats' | nc -w 1 localhost 11211 | grep -q 'uptime'"
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Security context - rodar como usuario nao-root
+          securityContext:
+            runAsUser: 11211
+            runAsGroup: 11211
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          # Volume para tmp (quando necessario)
+          volumeMounts:
+            - name: memcached-tmp
+              mountPath: /tmp
+      volumes:
+        - name: memcached-tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      securityContext:
+        fsGroup: 11211
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memcached
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: memcached
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: incubadora
+spec:
+  type: ClusterIP
+  ports:
+    - name: memcached
+      port: 11211
+      targetPort: memcached
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: memcached
+    app.kubernetes.io/component: cache
+---
+# =============================================================================
+# NetworkPolicy - Allow Memcached access from app namespaces
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: memcached-allow-cross-namespace
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: memcached
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: incubadora
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: memcached
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from OpenProject namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/component: openproject
+      ports:
+        - protocol: TCP
+          port: 11211
+    # Allow from Mattermost namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/component: mattermost
+      ports:
+        - protocol: TCP
+          port: 11211

@@ -1,0 +1,261 @@
+# =============================================================================
+# scaffold.yaml — PROJECT SCAFFOLD & COMPLETE RESOURCE REFERENCE
+# =============================================================================
+# OpenProject 15 + Mattermost Team Edition
+# K3s Single-Node | Oracle A1 Flex (4 OCPU / 24 GB RAM) | Ubuntu 22.04 ARM64
+#
+# This file is the DEFINITIVE project scaffold. It serves as:
+#   1. A human-readable architecture reference
+#   2. A deployment order guide
+#   3. A cross-namespace dependency map
+#   4. A resource budget tracker
+#
+# To deploy everything, use the Kustomize kustomization.yaml:
+#   kubectl apply -k .
+# Or deploy files in order (see DEPLOYMENT ORDER below).
+#
+# =============================================================================
+# ARCHITECTURE OVERVIEW
+# =============================================================================
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Oracle A1 Flex — 1 VM — 4 OCPU / 24 GB RAM — Ubuntu 22.04    │
+# │                                                                 │
+# │  K3s Single-Node Cluster (control-plane + worker in 1 VM)       │
+# │                                                                 │
+# │  ┌──────────────────────────────────────────────────────────┐   │
+# │  │  Namespace: incubadora-infra                             │   │
+# │  │  ├─ PostgreSQL 17  (4GB RAM, 1 CPU)  [shared]           │   │
+# │  │  ├─ Memcached 1.6   (512MB RAM)       [shared]           │   │
+# │  │  └─ NetworkPolicy: allow from openproject + mattermost   │   │
+# │  ├──────────────────────────────────────────────────────────┤   │
+# │  │  Namespace: incubadora-openproject                       │   │
+# │  │  ├─ OpenProject 15  (3GB RAM, 1.5 CPU)                  │   │
+# │  │  ├─ PVC: openproject-data (30Gi)                         │   │
+# │  │  └─ NetworkPolicy: egress to infra:5432 + infra:11211   │   │
+# │  ├──────────────────────────────────────────────────────────┤   │
+# │  │  Namespace: incubadora-mattermost                        │   │
+# │  │  ├─ Mattermost Team  (2GB RAM, 0.5 CPU)                  │   │
+# │  │  ├─ PVC: mattermost-data (20Gi) + mattermost-plugins (2Gi)│  │
+# │  │  └─ NetworkPolicy: egress to infra:5432 + infra:11211   │   │
+# │  ├──────────────────────────────────────────────────────────┤   │
+# │  │  Namespace: incubadora-backup                            │   │
+# │  │  ├─ CronJob: daily pg_dump (02:00 UTC)                   │   │
+# │  │  ├─ CronJob: weekly verify (Sunday 04:00 UTC)            │   │
+# │  │  ├─ PVC: backup-data (20Gi)                              │   │
+# │  │  └─ NetworkPolicy: egress to infra:5432                  │   │
+# │  ├──────────────────────────────────────────────────────────┤   │
+# │  │  Namespace: cert-manager  (system)                       │   │
+# │  │  ├─ ClusterIssuers: letsencrypt-prod + letsencrypt-staging│  │
+# │  │  └─ Certificates: openproject-tls + mattermost-tls       │   │
+# │  ├──────────────────────────────────────────────────────────┤   │
+# │  │  Namespace: traefik  (system)                            │   │
+# │  │  ├─ Traefik v2 (Ingress Controller)                     │   │
+# │  │  └─ ACME resolver via Cloudflare DNS-01                  │   │
+# │  └──────────────────────────────────────────────────────────┘   │
+# │                                                                 │
+# │  RESOURCE BUDGET:                                               │
+# │  ├─ Apps:    ~10.1 GB RAM / 3.0 CPU                            │
+# │  ├─ K3s:     ~0.5 GB RAM / 0.3 CPU                             │
+# │  ├─ OS+Docker: ~1.5 GB RAM / 0.5 CPU                           │
+# │  └─ Free:    ~12 GB RAM / 0.7 CPU                               │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# =============================================================================
+# DEPLOYMENT ORDER (strict — dependencies must exist first)
+# =============================================================================
+#
+# STEP 1 — NAMESPACE FOUNDATION
+#   $ kubectl apply -f namespaces.yaml
+#   Creates: incubadora-infra, incubadora-openproject,
+#            incubadora-mattermost, incubadora-backup
+#
+# STEP 2 — NETWORK POLICIES (security baseline before any workloads)
+#   $ kubectl apply -f network-policies.yaml
+#   Creates: default-deny rules + DNS allow rules in all namespaces
+#
+# STEP 3 — INFRASTRUCTURE (shared services in incubadora-infra)
+#   $ kubectl apply -f postgresql.yaml
+#   Creates: ConfigMap, Secret, PVC, StatefulSet, Service, NetworkPolicy
+#   $ kubectl apply -f memcached.yaml
+#   Creates: Deployment, Service, NetworkPolicy
+#   WAIT: kubectl wait --for=condition=Ready pod/postgresql-0 -n incubadora-infra --timeout=180s
+#         kubectl wait --for=condition=Available deployment/memcached -n incubadora-infra --timeout=120s
+#
+# STEP 4 — CERTIFICATES (before apps need TLS)
+#   PREREQ: Cloudflare API token secret in cert-manager namespace
+#   $ kubectl create secret generic cloudflare-api-token \
+#       --from-literal=api-token=YOUR_TOKEN -n cert-manager
+#   $ kubectl apply -f cert-manager.yaml
+#   Creates: ClusterIssuers (prod+staging), Certificates (openproject+mattermost)
+#
+# STEP 5 — APPLICATIONS
+#   $ kubectl apply -f openproject.yaml
+#   Creates: ConfigMap, Secret, Deployment, PVC, Service, NetworkPolicies, IngressRoutes, Middlewares
+#   $ kubectl apply -f mattermost.yaml
+#   Creates: ConfigMap, Secret, Deployment, PVCs, Service, NetworkPolicies, IngressRoutes, Middlewares
+#
+# STEP 6 — BACKUP
+#   $ kubectl apply -f backup-cronjob.yaml
+#   Creates: PVC, ConfigMap, Secret, NetworkPolicy, CronJobs (daily+verify)
+#
+# =============================================================================
+# CROSS-NAMESPACE SERVICE DEPENDENCIES
+# =============================================================================
+#
+# incubadora-openproject → incubadora-infra:
+#   PostgreSQL:  postgresql.incubadora-infra.svc.cluster.local:5432
+#   Memcached:   memcached.incubadora-infra.svc.cluster.local:11211
+#
+# incubadora-mattermost → incubadora-infra:
+#   PostgreSQL:  postgresql.incubadora-infra.svc.cluster.local:5432
+#   Memcached:   memcached.incubadora-infra.svc.cluster.local:11211
+#
+# incubadora-backup → incubadora-infra:
+#   PostgreSQL:  postgresql.incubadora-infra.svc.cluster.local:5432 (read-only pg_dump)
+#
+# traefik → incubadora-openproject:
+#   HTTP: openproject.incubadora-openproject.svc.cluster.local:8080
+#
+# traefik → incubadora-mattermost:
+#   HTTP: mattermost.incubadora-mattermost.svc.cluster.local:8065
+#
+# =============================================================================
+# SECRETS REQUIRED (must be created before deployment)
+# =============================================================================
+#
+# Namespace: incubadora-infra
+#   postgres-secret:
+#     POSTGRES_PASSWORD:       (superuser password)
+#     OPENPROJECT_PASSWORD:    (openproject DB user password)
+#     MATTERMOST_PASSWORD:     (mattermost DB user password)
+#
+# Namespace: incubadora-openproject
+#   openproject-secret:
+#     OPENPROJECT_SECRET_KEY_BASE:  (64-char random hex)
+#     OPENPROJECT_DB__PASSWORD:     (must match OPENPROJECT_PASSWORD above)
+#     OPENPROJECT_EMAIL__SMTP__PASSWORD:
+#     OPENPROJECT_ADMIN__PASSWORD:
+#     OPENPROJECT_ADMIN__EMAIL:
+#
+# Namespace: incubadora-mattermost
+#   mattermost-secret:
+#     MM_SQLSETTINGS_DATASOURCE:     (connection string, must match MATTERMOST_PASSWORD)
+#     MM_EMAILSETTINGS_SMTPPASSWORD:
+#
+# Namespace: incubadora-backup
+#   postgres-backup-secret:
+#     POSTGRES_PASSWORD:  (must match superuser password in incubadora-infra)
+#
+# Namespace: cert-manager
+#   cloudflare-api-token:
+#     api-token:  (Cloudflare API Token with Zone:DNS:Edit)
+#
+# =============================================================================
+# RESOURCE BUDGET TABLE
+# =============================================================================
+#
+# | Namespace              | Component      | CPU req  | CPU lim  | RAM req  | RAM lim  |
+# |------------------------|----------------|----------|----------|----------|----------|
+# | incubadora-infra       | PostgreSQL 17  | 500m     | 1000m    | 2Gi      | 4Gi      |
+# | incubadora-infra       | Memcached 1.6  | 100m     | 200m     | 256Mi    | 512Mi    |
+# | incubadora-openproject | OpenProject 15 | 500m     | 1500m    | 2Gi      | 3Gi      |
+# | incubadora-openproject | initContainer  | 0        | 100m     | 0        | 128Mi    |
+# | incubadora-mattermost  | Mattermost     | 250m     | 500m     | 1Gi      | 2Gi      |
+# | incubadora-mattermost  | initContainers | 0        | 150m     | 0        | 192Mi    |
+# | incubadora-backup      | daily backup   | 100m     | 500m     | 128Mi    | 512Mi    |
+# | incubadora-backup      | weekly verify  | 50m      | 200m     | 64Mi     | 256Mi    |
+# | traefik                | Traefik v2     | 100m     | 1000m    | 128Mi    | 512Mi    |
+# | cert-manager           | cert-manager   | 50m      | 200m     | 64Mi     | 256Mi    |
+# |------------------------|----------------|----------|----------|----------|----------|
+# | TOTAL                  |                | 1750m    | 5350m    | ~6.1Gi   | ~11.2Gi  |
+# | K3s system             |                | 200m     | 300m     | 400Mi    | 500Mi    |
+# | OS + container runtime |                | 500m     | 500m     | 1.5Gi    | 1.5Gi    |
+# | FREE                   |                | ~1750m   | ~8350m   | ~16Gi    | ~10.8Gi  |
+#
+# Storage:
+# | Namespace              | PVC Name           | Size   | StorageClass |
+# |------------------------|--------------------|--------|--------------|
+# | incubadora-infra       | postgres-data      | 50Gi   | local-path   |
+# | incubadora-openproject | openproject-data   | 30Gi   | local-path   |
+# | incubadora-mattermost  | mattermost-data    | 20Gi   | local-path   |
+# | incubadora-mattermost  | mattermost-plugins | 2Gi    | local-path   |
+# | incubadora-backup      | backup-data        | 20Gi   | local-path   |
+# |------------------------|--------------------|--------|--------------|
+# | TOTAL                  |                    | 122Gi  |              |
+#
+# =============================================================================
+# PVC SUMMARY
+# =============================================================================
+#
+# NOTE: On Oracle Free Tier, total block storage is limited to 200 GB.
+# The 122 Gi allocated leaves ~78 Gi for OS, Docker images, and K3s.
+# If you need more space, reduce postgres-data from 50Gi to 30Gi.
+#
+# =============================================================================
+# VERIFICATION COMMANDS
+# =============================================================================
+#
+# Check all namespaces:
+#   kubectl get namespaces -l app.kubernetes.io/part-of=incubadora
+#
+# Check all pods across incubadora namespaces:
+#   kubectl get pods -A -l app.kubernetes.io/part-of=incubadora
+#
+# Check network policies:
+#   kubectl get networkpolicies -A -l app.kubernetes.io/part-of=incubadora
+#
+# Check certificates:
+#   kubectl get certificates -A -l app.kubernetes.io/part-of=incubadora
+#
+# Check ingress routes:
+#   kubectl get ingressroutes -A -l app.kubernetes.io/part-of=incubadora
+#
+# Check PVCs:
+#   kubectl get pvc -A -l app.kubernetes.io/part-of=incubadora
+#
+# Check cross-namespace connectivity:
+#   kubectl run test-curl -it --rm --image=curlimages/curl --restart=Never -- \
+#     curl -s http://postgresql.incubadora-infra.svc.cluster.local:5432
+#
+# Monitor backup jobs:
+#   kubectl get cronjobs -n incubadora-backup
+#   kubectl logs job/<backup-job-name> -n incubadora-backup
+#
+# =============================================================================
+# TEARDOWN
+# =============================================================================
+#
+# To remove everything:
+#   kubectl delete -f backup-cronjob.yaml
+#   kubectl delete -f mattermost.yaml
+#   kubectl delete -f openproject.yaml
+#   kubectl delete -f cert-manager.yaml
+#   kubectl delete -f memcached.yaml
+#   kubectl delete -f postgresql.yaml
+#   kubectl delete -f network-policies.yaml
+#   kubectl delete -f namespaces.yaml
+#
+# WARNING: Deleting namespaces will delete all PVCs and data!
+#
+# =============================================================================
+# FILE INVENTORY
+# =============================================================================
+#
+# k3s/
+# ├── scaffold.yaml            THIS FILE — project scaffold & reference
+# ├── kustomization.yaml       Kustomize root — orchestrate all resources
+# ├── namespaces.yaml          4 namespaces (infra, openproject, mattermost, backup)
+# ├── network-policies.yaml    Default deny + DNS allow for all namespaces
+# ├── postgresql.yaml          PostgreSQL 17 in incubadora-infra
+# ├── memcached.yaml           Memcached 1.6 in incubadora-infra
+# ├── openproject.yaml         OpenProject 15 in incubadora-openproject
+# ├── mattermost.yaml          Mattermost Team in incubadora-mattermost
+# ├── cert-manager.yaml        ClusterIssuers + Certificates (multi-namespace)
+# ├── backup-cronjob.yaml      Daily/weekly backup CronJobs in incubadora-backup
+# ├── traefik-values.yaml      Helm values for Traefik Ingress Controller
+# ├── install-k3s.sh           K3s + Helm + cert-manager + Traefik installer
+# ├── .env.example             Environment variables template
+# └── README.md                Documentation
+#
+# =============================================================================

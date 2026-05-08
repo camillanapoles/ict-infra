@@ -1,0 +1,230 @@
+# ============================================================================
+# traefik-values.yaml - Valores do Helm Chart do Traefik
+# ============================================================================
+# Configuracao do Traefik como Ingress Controller com:
+# - Let's Encrypt ACME via Cloudflare DNS-01 challenge
+# - TLS options modern (TLS 1.3, cipher suites fortes)
+# - Middlewares: security headers, rate limiting, compressao
+# - Redirecao automatica HTTP -> HTTPS
+#
+# IMPORTANTE: Configure o CLOUDFLARE_API_TOKEN e CLOUDFLARE_EMAIL
+# antes de aplicar este chart. O DNS-01 challenge e mais confiavel
+# que o HTTP-01 quando usando Cloudflare proxy (orange cloud).
+#
+# Uso:
+#   helm upgrade --install traefik traefik/traefik \
+#     --namespace traefik --create-namespace \
+#     -f traefik-values.yaml
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# Deployment
+# --------------------------------------------------------------------------
+deployment:
+  replicas: 1
+  # Garantir que rode em ARM64
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9100"
+  podLabels:
+    app.kubernetes.io/name: traefik
+  initContainers:
+    - name: volume-permissions
+      image: busybox:1.36
+      command: ["sh", "-c", "chmod -R 775 /data"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  # Rodar como non-root
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+
+# --------------------------------------------------------------------------
+# Ports
+# --------------------------------------------------------------------------
+ports:
+  web:
+    port: 80
+    exposedPort: 80
+    redirectTo: websecure  # Redirecionar todo HTTP para HTTPS
+  websecure:
+    port: 443
+    exposedPort: 443
+    tls:
+      enabled: true
+      certResolver: cloudflare  # Usar Cloudflare DNS resolver
+    http3:
+      enabled: true  # HTTP/3 (QUIC) para melhor performance
+  metrics:
+    port: 9100
+    exposedPort: 9100
+
+# --------------------------------------------------------------------------
+# TLS Options - Modern (TLS 1.3 preferido)
+# --------------------------------------------------------------------------
+tlsOptions:
+  modern:
+    minVersion: VersionTLS13
+    cipherSuites:
+      - TLS_AES_128_GCM_SHA256
+      - TLS_AES_256_GCM_SHA384
+      - TLS_CHACHA20_POLY1305_SHA256
+    sniStrict: true
+
+# --------------------------------------------------------------------------
+# Certificates - Let's Encrypt via Cloudflare DNS-01
+# --------------------------------------------------------------------------
+# O DNS-01 challenge funciona mesmo com Cloudflare proxy ativado,
+# diferente do HTTP-01 que pode falhar quando o proxy esta on.
+certificatesResolvers:
+  cloudflare:
+    acme:
+      # Email para Let's Encrypt (notificacoes de expiracao)
+      email: "admin@seudominio.com"
+      # Servidor Let's Encrypt (usar staging para testes!)
+      # staging: https://acme-staging-v02.api.letsencrypt.org/directory
+      # production: https://acme-v02.api.letsencrypt.org/directory
+      server: https://acme-v02.api.letsencrypt.org/directory
+      storage: /data/acme.json
+      # DNS-01 challenge via Cloudflare API
+      dnsChallenge:
+        provider: cloudflare
+        # Delay apos criar o registro DNS (Cloudflare propaga rapido)
+        delayBeforeCheck: 10
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"
+          - "8.8.4.4:53"
+
+# --------------------------------------------------------------------------
+# Environment Variables - Cloudflare API Token para ACME
+# --------------------------------------------------------------------------
+env:
+  - name: CF_API_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: cloudflare-api-token
+        key: api-token
+        optional: false
+  - name: CF_ZONE_API_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: cloudflare-api-token
+        key: api-token
+        optional: false
+
+# --------------------------------------------------------------------------
+# Secret para Cloudflare API Token (referenciado acima)
+# Crie este secret ANTES de instalar o chart:
+#   kubectl create secret generic cloudflare-api-token \
+#     --from-literal=api-token=SEU_CLOUDFLARE_API_TOKEN \
+#     -n traefik
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Persistence - Para ACME certificates e config
+# --------------------------------------------------------------------------
+persistence:
+  enabled: true
+  name: traefik-data
+  size: 1Gi
+  storageClass: local-path
+  path: /data
+
+# --------------------------------------------------------------------------
+# Logs
+# --------------------------------------------------------------------------
+logs:
+  general:
+    level: INFO
+  access:
+    enabled: true
+    fields:
+      headers:
+        defaultMode: drop
+
+# --------------------------------------------------------------------------
+# RBAC
+# --------------------------------------------------------------------------
+rbac:
+  enabled: true
+
+# --------------------------------------------------------------------------
+# Service
+# --------------------------------------------------------------------------
+service:
+  type: LoadBalancer
+  # Se nao tiver LoadBalancer disponivel (ex: K3s single-node),
+  # comente a linha acima e use:
+  # type: NodePort
+  # nodePorts:
+  #   web: 30080
+  #   websecure: 30443
+  spec:
+    # External traffic policy para preservar IP do cliente
+    externalTrafficPolicy: Local
+  loadBalancerIP: ""  # Deixe vazio para auto-atribuicao do OCI LB
+  annotations:
+    # OCI Load Balancer annotations (se usar OCI)
+    # oci.oraclecloud.com/load-balancer-type: "flexible"
+    # oci.oraclecloud.com/security-list-management: "All"
+    service.beta.kubernetes.io/oci-load-balancer-shape: "flexible"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-min: "10"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-max: "10"
+
+# --------------------------------------------------------------------------
+# Additional Arguments
+# --------------------------------------------------------------------------
+additionalArguments:
+  # API insecure (para desenvolvimento)
+  - "--api.insecure=true"
+  # API dashboard
+  - "--api.dashboard=true"
+  # Piloto metrics
+  - "--metrics.prometheus=true"
+  # Access logs
+  - "--accesslog=true"
+  # Log level
+  - "--log.level=INFO"
+  # Entrypoints
+  - "--entrypoints.web.address=:80"
+  - "--entrypoints.websecure.address=:443"
+  - "--entrypoints.websecure.http3"
+  # Providers
+  - "--providers.kubernetesingress=true"
+  - "--providers.kubernetesingress.ingressclass=traefik"
+  - "--providers.kubernetescrd=true"
+  - "--providers.file.directory=/etc/traefik/dynamic"
+  - "--providers.file.watch=true"
+
+# --------------------------------------------------------------------------
+# VolumeMounts adicionais (para ACME storage)
+# --------------------------------------------------------------------------
+volumes:
+  - name: data
+    hostPath:
+      path: /var/lib/traefik
+      type: DirectoryOrCreate
+volumeMounts:
+  - name: data
+    mountPath: /data
+
+# --------------------------------------------------------------------------
+# Toleration para no master (single-node cluster)
+# --------------------------------------------------------------------------
+tolerations:
+  - key: "node-role.kubernetes.io/master"
+    operator: "Exists"
+    effect: "NoSchedule"
+  - key: "node-role.kubernetes.io/control-plane"
+    operator: "Exists"
+    effect: "NoSchedule"

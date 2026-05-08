@@ -1,0 +1,14 @@
+# ============================================================================
+# namespace.yaml - Namespace para os componentes do projeto Incubadora
+# ============================================================================
+# Todos os componentes do OpenProject + Mattermost sao implantados neste
+# namespace para isolamento e organizacao.
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: incubadora
+  labels:
+    app.kubernetes.io/name: incubadora
+    app.kubernetes.io/part-of: openproject-mattermost
+    environment: production

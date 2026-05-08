@@ -1,0 +1,67 @@
+# =============================================================================
+# namespaces.yaml - Multi-Namespace Definitions
+# =============================================================================
+# Single VM architecture with namespace-based isolation.
+# Each namespace represents a logical boundary for security and organization.
+#
+# Architecture: Oracle A1 Flex — 1 VM — 4 OCPU / 24 GB RAM
+# =============================================================================
+apiVersion: v1
+kind: List
+items:
+  # ---------------------------------------------------------------------------
+  # Namespace: incubadora-infra
+  # Shared infrastructure services (PostgreSQL, Memcached)
+  # ---------------------------------------------------------------------------
+  - apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: incubadora-infra
+      labels:
+        app.kubernetes.io/part-of: incubadora
+        app.kubernetes.io/component: infrastructure
+        environment: production
+        # NetworkPolicy target label
+        incubadora.io/network-policy: infra
+
+  # ---------------------------------------------------------------------------
+  # Namespace: incubadora-openproject
+  # OpenProject 15 project management application
+  # ---------------------------------------------------------------------------
+  - apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: incubadora-openproject
+      labels:
+        app.kubernetes.io/part-of: incubadora
+        app.kubernetes.io/component: openproject
+        environment: production
+        incubadora.io/network-policy: application
+
+  # ---------------------------------------------------------------------------
+  # Namespace: incubadora-mattermost
+  # Mattermost Team Edition messaging platform
+  # ---------------------------------------------------------------------------
+  - apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: incubadora-mattermost
+      labels:
+        app.kubernetes.io/part-of: incubadora
+        app.kubernetes.io/component: mattermost
+        environment: production
+        incubadora.io/network-policy: application
+
+  # ---------------------------------------------------------------------------
+  # Namespace: incubadora-backup
+  # Backup CronJobs and storage (pg_dump, verification)
+  # ---------------------------------------------------------------------------
+  - apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: incubadora-backup
+      labels:
+        app.kubernetes.io/part-of: incubadora
+        app.kubernetes.io/component: backup
+        environment: production
+        incubadora.io/network-policy: backup

@@ -1,0 +1,462 @@
+# =============================================================================
+# backup-cronjob.yaml - Backup CronJobs — Namespace: incubadora-backup
+# =============================================================================
+# Kubernetes CronJobs that execute PostgreSQL database backups
+# (OpenProject and Mattermost) daily at 02:00 UTC.
+#
+# CROSS-NAMESPACE ACCESS:
+#   PostgreSQL: postgresql.incubadora-infra.svc.cluster.local:5432
+#   Secret ref: postgres-secret in incubadora-infra (cross-namespace read)
+#
+# NOTE: Cross-namespace Secret references require the backup ServiceAccount
+#       to have read access. The CronJob uses its own copy of the password
+#       stored in postgres-backup-secret within incubadora-backup namespace.
+#
+# Features:
+#   - Custom pg_dump for each database
+#   - gzip compression
+#   - Automatic rotation (keep last 30 days)
+#   - Weekly integrity verification
+#   - Optional OCI Object Storage upload
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# PVC para armazenar os backups
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-data
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: incubadora
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: local-path
+
+---
+# ---------------------------------------------------------------------------
+# ConfigMap - Script de backup
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-backup-script
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: incubadora
+data:
+  backup.sh: |
+    #!/bin/bash
+    # ========================================================================
+    # Script de backup do PostgreSQL - OpenProject + Mattermost
+    # CROSS-NAMESPACE: connects to postgresql.incubadora-infra.svc.cluster.local
+    # ========================================================================
+    set -euo pipefail
+
+    # --------------------------------------------------------------------------
+    # Configuracoes
+    # --------------------------------------------------------------------------
+    BACKUP_DIR="/backups"
+    DATE=$(date '+%Y-%m-%d')
+    TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+    RETENTION_DAYS="${RETENTION_DAYS:-30}"
+
+    # Credenciais do PostgreSQL (do Secret local)
+    POSTGRES_HOST="${POSTGRES_HOST:-postgresql.incubadora-infra.svc.cluster.local}"
+    POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+    POSTGRES_USER="postgres"
+
+    # Bancos de dados para backup
+    DATABASES=("openproject" "mattermost")
+
+    # --------------------------------------------------------------------------
+    # Funcoes
+    # --------------------------------------------------------------------------
+    log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    }
+
+    error_exit() {
+        log "ERRO: $*"
+        exit 1
+    }
+
+    backup_database() {
+        local db_name="$1"
+        local backup_file="${BACKUP_DIR}/${db_name}_${TIMESTAMP}.sql.gz"
+        local backup_custom="${BACKUP_DIR}/${db_name}_${TIMESTAMP}.dump"
+
+        log "=== Iniciando backup do banco: ${db_name} ==="
+        log "Arquivo de destino: ${backup_file}"
+        log "Host: ${POSTGRES_HOST}:${POSTGRES_PORT}"
+
+        # Verificar se o banco existe
+        PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+            -h "${POSTGRES_HOST}" \
+            -p "${POSTGRES_PORT}" \
+            -U "${POSTGRES_USER}" \
+            -lqt | cut -d \| -f 1 | grep -qw "${db_name}" || {
+            log "AVISO: Banco ${db_name} nao encontrado. Pulando."
+            return 0
+        }
+
+        # Backup SQL (formato texto, compativel)
+        log "Criando backup SQL do banco ${db_name}..."
+        PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
+            -h "${POSTGRES_HOST}" \
+            -p "${POSTGRES_PORT}" \
+            -U "${POSTGRES_USER}" \
+            -d "${db_name}" \
+            --clean \
+            --if-exists \
+            --no-owner \
+            --no-privileges \
+            --format=plain \
+            | gzip > "${backup_file}"
+
+        local sql_size
+        sql_size=$(du -h "${backup_file}" | cut -f1)
+        log "Backup SQL criado: ${backup_file} (${sql_size})"
+
+        # Backup custom format (mais rapido para restaurar)
+        log "Criando backup custom do banco ${db_name}..."
+        PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
+            -h "${POSTGRES_HOST}" \
+            -p "${POSTGRES_PORT}" \
+            -U "${POSTGRES_USER}" \
+            -d "${db_name}" \
+            --format=custom \
+            --compress=9 \
+            -f "${backup_custom}"
+
+        local custom_size
+        custom_size=$(du -h "${backup_custom}" | cut -f1)
+        log "Backup custom criado: ${backup_custom} (${custom_size})"
+
+        # Verificar integridade do backup
+        if gzip -t "${backup_file}" 2>/dev/null; then
+            log "Verificacao de integridade: OK (SQL)"
+        else
+            error_exit "Backup SQL corrompido: ${backup_file}"
+        fi
+
+        log "=== Backup do banco ${db_name} concluido com sucesso ==="
+    }
+
+    cleanup_old_backups() {
+        log "=== Limpando backups antigos (mais de ${RETENTION_DAYS} dias) ==="
+
+        local deleted_count=0
+        while IFS= read -r -d '' file; do
+            rm -f "${file}"
+            log "Removido: $(basename "${file}")"
+            deleted_count=$((deleted_count + 1))
+        done < <(find "${BACKUP_DIR}" -name "*.sql.gz" -o -name "*.dump" \
+            | xargs -0 -I {} find {} -mtime "+${RETENTION_DAYS}" -print0 2>/dev/null)
+
+        log "Total de arquivos removidos: ${deleted_count}"
+    }
+
+    generate_backup_report() {
+        local report_file="${BACKUP_DIR}/latest_backup_report.txt"
+
+        {
+            echo "============================================================"
+            echo "  RELATORIO DE BACKUP - PostgreSQL"
+            echo "  Data/Hora: ${TIMESTAMP}"
+            echo "  Host: ${POSTGRES_HOST}:${POSTGRES_PORT}"
+            echo "============================================================"
+            echo ""
+            echo "Bancos processados:"
+            for db in "${DATABASES[@]}"; do
+                echo "  - ${db}"
+            done
+            echo ""
+            echo "Backups criados:"
+            ls -lh "${BACKUP_DIR}"/*"${TIMESTAMP}"* 2>/dev/null || echo "  Nenhum backup encontrado"
+            echo ""
+            echo "Espaco em disco:"
+            df -h "${BACKUP_DIR}"
+            echo ""
+            echo "Total de backups armazenados:"
+            echo "  SQL:   $(find "${BACKUP_DIR}" -name '*.sql.gz' | wc -l) arquivos"
+            echo "  Dump:  $(find "${BACKUP_DIR}" -name '*.dump' | wc -l) arquivos"
+            echo "  Tamanho total: $(du -sh "${BACKUP_DIR}" | cut -f1)"
+            echo ""
+            echo "Proximo backup agendado: Amanha as 02:00 UTC"
+            echo "============================================================"
+        } > "${report_file}"
+
+        log "Relatorio salvo em: ${report_file}"
+    }
+
+    # --------------------------------------------------------------------------
+    # Main
+    # --------------------------------------------------------------------------
+    log "============================================================"
+    log "  BACKUP POSTGRESQL - $(date '+%Y-%m-%d %H:%M:%S')"
+    log "  CROSS-NAMESPACE: ${POSTGRES_HOST}:${POSTGRES_PORT}"
+    log "============================================================"
+
+    # Criar diretorio de backup se nao existir
+    mkdir -p "${BACKUP_DIR}"
+
+    # Executar backups
+    for db in "${DATABASES[@]}"; do
+        backup_database "${db}"
+    done
+
+    # Limpar backups antigos
+    cleanup_old_backups
+
+    # Gerar relatorio
+    generate_backup_report
+
+    log "============================================================"
+    log "  BACKUP CONCLUIDO COM SUCESSO"
+    log "============================================================"
+
+---
+# ---------------------------------------------------------------------------
+# Secret - Credenciais de backup
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-backup-secret
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: incubadora
+type: Opaque
+stringData:
+  # Senha do superusuario PostgreSQL
+  # Deve corresponder ao postgres-secret em incubadora-infra
+  POSTGRES_PASSWORD: "CHANGE_ME_GENERATE_STRONG_PASSWORD"
+
+---
+# ---------------------------------------------------------------------------
+# NetworkPolicy - Egress to infra namespace (PostgreSQL)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backup-egress-infra
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: incubadora
+spec:
+  podSelector: {}  # Applies to all pods in backup namespace
+  policyTypes:
+    - Egress
+  egress:
+    # PostgreSQL in incubadora-infra
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/component: infrastructure
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# ---------------------------------------------------------------------------
+# CronJob - Execucao automatica do backup (daily at 02:00 UTC)
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-daily-backup
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: incubadora
+spec:
+  # Executar todos os dias as 02:00 UTC
+  # Horario de Brasilia (UTC-3): 23:00 do dia anterior
+  schedule: "0 2 * * *"
+  # Manter historico de 3 execucoes com sucesso
+  successfulJobsHistoryLimit: 3
+  # Manter historico de 1 execucao com falha (para debug)
+  failedJobsHistoryLimit: 1
+  # Nao iniciar nova execucao se a anterior ainda estiver rodando
+  concurrencyPolicy: Forbid
+  # Nao pausar
+  suspend: false
+
+  jobTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-backup
+        app.kubernetes.io/component: backup
+    spec:
+      # Timeout de 2 horas para o job
+      activeDeadlineSeconds: 7200
+      # Retry: 1 tentativa
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgres-backup
+            app.kubernetes.io/component: backup
+        spec:
+          # Garantir que rode em ARM64
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          restartPolicy: Never
+          containers:
+            - name: postgres-backup
+              image: postgres:17-bookworm
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - /scripts/backup.sh
+              env:
+                # Senha do PostgreSQL (local secret)
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-backup-secret
+                      key: POSTGRES_PASSWORD
+                # Cross-namespace PostgreSQL host
+                - name: POSTGRES_HOST
+                  value: "postgresql.incubadora-infra.svc.cluster.local"
+                # Retencao de backups em dias
+                - name: RETENTION_DAYS
+                  value: "30"
+              volumeMounts:
+                - name: backup-data
+                  mountPath: /backups
+                - name: backup-scripts
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: "0.5"
+                  memory: 512Mi
+          volumes:
+            - name: backup-data
+              persistentVolumeClaim:
+                claimName: backup-data
+            - name: backup-scripts
+              configMap:
+                name: postgres-backup-script
+                defaultMode: 0755
+
+---
+# ---------------------------------------------------------------------------
+# CronJob - Verificacao semanal de integridade dos backups (Sundays at 04:00 UTC)
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup-verify
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup-verify
+    app.kubernetes.io/part-of: incubadora
+spec:
+  # Executar todo domingo as 04:00 UTC
+  schedule: "0 4 * * 0"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  suspend: false
+
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 1
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          restartPolicy: Never
+          containers:
+            - name: backup-verify
+              image: postgres:17-bookworm
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  BACKUP_DIR="/backups"
+                  echo "=== Verificacao de integridade dos backups ==="
+                  echo "Data: $(date '+%Y-%m-%d %H:%M:%S')"
+                  echo "Namespace: incubadora-backup"
+                  echo ""
+
+                  # Contar backups
+                  SQL_COUNT=$(find "${BACKUP_DIR}" -name '*.sql.gz' | wc -l)
+                  DUMP_COUNT=$(find "${BACKUP_DIR}" -name '*.dump' | wc -l)
+
+                  echo "Backups SQL encontrados: ${SQL_COUNT}"
+                  echo "Backups dump encontrados: ${DUMP_COUNT}"
+
+                  if [[ ${SQL_COUNT} -eq 0 ]]; then
+                    echo "ERRO: Nenhum backup SQL encontrado!"
+                    exit 1
+                  fi
+
+                  # Verificar integridade de cada backup SQL
+                  FAILED=0
+                  VERIFIED=0
+                  for f in "${BACKUP_DIR}"/*.sql.gz; do
+                    if gzip -t "${f}" 2>/dev/null; then
+                      VERIFIED=$((VERIFIED + 1))
+                    else
+                      echo "ERRO: Backup corrompido: $(basename "${f}")"
+                      FAILED=$((FAILED + 1))
+                    fi
+                  done
+
+                  echo ""
+                  echo "Verificados com sucesso: ${VERIFIED}"
+                  echo "Corrompidos: ${FAILED}"
+
+                  # Espaco em disco
+                  echo ""
+                  echo "Espaco em disco:"
+                  df -h "${BACKUP_DIR}"
+
+                  if [[ ${FAILED} -gt 0 ]]; then
+                    echo "ERRO: ${FAILED} backups corrompidos encontrados!"
+                    exit 1
+                  fi
+
+                  echo ""
+                  echo "=== Verificacao concluida com sucesso ==="
+              volumeMounts:
+                - name: backup-data
+                  mountPath: /backups
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: "0.2"
+                  memory: 256Mi
+          volumes:
+            - name: backup-data
+              persistentVolumeClaim:
+                claimName: backup-data

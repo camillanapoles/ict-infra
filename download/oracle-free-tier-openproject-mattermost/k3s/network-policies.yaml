@@ -1,0 +1,300 @@
+# =============================================================================
+# network-policies.yaml - Comprehensive Network Policies
+# =============================================================================
+# Default deny + explicit allow rules for all incubadora namespaces.
+#
+# NETWORK POLICY STRATEGY:
+#   1. Default deny all ingress and egress in each namespace
+#   2. Allow DNS resolution (CoreDNS egress) — required for service discovery
+#   3. Allow intra-namespace traffic where needed
+#   4. Allow specific cross-namespace traffic (apps → infra)
+#   5. Allow Traefik ingress controller to reach app pods
+#   6. Allow Kubernetes API server access (health checks, leader election)
+#
+# NOTE: Per-service specific policies (PostgreSQL, Memcached, etc.) are defined
+#       in their respective YAML files. This file contains the baseline defaults.
+#
+# TRAFFIC FLOW:
+#   Internet → OCI LB → Traefik (traefik NS) → App Pods (app NS) → DB (infra NS)
+#   Backup Pods (backup NS) → DB (infra NS)
+# =============================================================================
+
+# =============================================================================
+# NAMESPACE: incubadora-infra — Default Deny
+# =============================================================================
+# NOTE: Specific allow rules for PostgreSQL and Memcached are in their own YAMLs.
+#       This policy ensures no other ingress/egress is allowed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# Allow DNS egress (CoreDNS) — required for all namespaces
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: allow-dns
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+# =============================================================================
+# NAMESPACE: incubadora-openproject — Default Deny + DNS + Kube API
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# Allow DNS egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: allow-dns
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Allow Kubernetes API server egress (required for leader election, health checks)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kube-api-egress
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: allow-kube-api
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.43.0.1/32  # K3s API server service IP
+      ports:
+        - protocol: TCP
+          port: 6443
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0  # Allow external image pulls (not restricted)
+      ports:
+        - protocol: TCP
+          port: 443
+
+# =============================================================================
+# NAMESPACE: incubadora-mattermost — Default Deny + DNS + Kube API
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: incubadora-mattermost
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: incubadora-mattermost
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# Allow DNS egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: incubadora-mattermost
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: allow-dns
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Allow Kubernetes API server egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kube-api-egress
+  namespace: incubadora-mattermost
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: allow-kube-api
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.43.0.1/32
+      ports:
+        - protocol: TCP
+          port: 6443
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+
+# =============================================================================
+# NAMESPACE: incubadora-backup — Default Deny + DNS
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# Allow DNS egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: incubadora-backup
+  labels:
+    app.kubernetes.io/part-of: incubadora
+    policy: allow-dns
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

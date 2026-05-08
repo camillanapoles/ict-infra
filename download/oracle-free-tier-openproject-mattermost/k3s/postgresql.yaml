@@ -1,0 +1,414 @@
+# =============================================================================
+# postgresql.yaml - PostgreSQL 17 — Namespace: incubadora-infra
+# =============================================================================
+# StatefulSet do PostgreSQL 17 com:
+# - Persistent Volume Claim para dados persistentes
+# - ConfigMap com scripts de inicializacao (multi-banco)
+# - Secret para senha do superusuario
+# - Service ClusterIP para acesso interno (cross-namespace)
+# - NetworkPolicy: allow ingress from incubadora-openproject + incubadora-mattermost
+# - Resources: 4 GB RAM, 1 CPU limit (otimizado para Oracle A1 Flex)
+#
+# CROSS-NAMESPACE ACCESS:
+#   Service FQDN: postgresql.incubadora-infra.svc.cluster.local:5432
+#   Consumers: incubadora-openproject (openproject user/db)
+#               incubadora-mattermost (mattermost user/db)
+#               incubadora-backup (postgres superuser, read-only dumps)
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-scripts
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: incubadora
+data:
+  # ---------------------------------------------------------------------------
+  # Script de inicializacao - Cria os bancos de dados separados
+  # OpenProject e Mattermost usam bancos PostgreSQL distintos
+  # ---------------------------------------------------------------------------
+  init-multi-db.sh: |
+    #!/bin/bash
+    set -e
+
+    # Variaveis de ambiente
+    POSTGRES_USER="${POSTGRES_USER:-postgres}"
+    POSTGRES_DB="${POSTGRES_DB:-postgres}"
+
+    # Banco de dados do OpenProject
+    OPENPROJECT_DB="${OPENPROJECT_DB:-openproject}"
+    OPENPROJECT_USER="${OPENPROJECT_USER:-openproject}"
+    OPENPROJECT_PASSWORD="${OPENPROJECT_PASSWORD:-openproject_password}"
+
+    # Banco de dados do Mattermost
+    MATTERMOST_DB="${MATTERMOST_DB:-mattermost}"
+    MATTERMOST_USER="${MATTERMOST_USER:-mattermost}"
+    MATTERMOST_PASSWORD="${MATTERMOST_PASSWORD:-mattermost_password}"
+
+    echo "=== Inicializando bancos de dados multi-tenant ==="
+
+    # Criar bancos de dados e usuarios se nao existirem
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+        -- Criar usuario e banco do OpenProject
+        DO \$\$
+        BEGIN
+            IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${OPENPROJECT_USER}') THEN
+                CREATE ROLE ${OPENPROJECT_USER} WITH LOGIN PASSWORD '${OPENPROJECT_PASSWORD}';
+            END IF;
+        END
+        \$\$;
+
+        SELECT 'CREATE DATABASE ${OPENPROJECT_DB} OWNER ${OPENPROJECT_USER}'
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${OPENPROJECT_DB}')\gexec
+
+        -- Criar usuario e banco do Mattermost
+        DO \$\$
+        BEGIN
+            IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${MATTERMOST_USER}') THEN
+                CREATE ROLE ${MATTERMOST_USER} WITH LOGIN PASSWORD '${MATTERMOST_PASSWORD}';
+            END IF;
+        END
+        \$\$;
+
+        SELECT 'CREATE DATABASE ${MATTERMOST_DB} OWNER ${MATTERMOST_USER}'
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${MATTERMOST_DB}')\gexec
+
+        -- Garantir permissoes
+        GRANT ALL PRIVILEGES ON DATABASE ${OPENPROJECT_DB} TO ${OPENPROJECT_USER};
+        GRANT ALL PRIVILEGES ON DATABASE ${MATTERMOST_DB} TO ${MATTERMOST_USER};
+
+        -- Configuracoes de otimizacao para o OpenProject
+        ALTER DATABASE ${OPENPROJECT_DB} SET shared_preload_libraries = 'pg_stat_statements';
+        ALTER DATABASE ${OPENPROJECT_DB} SET work_mem = '64MB';
+
+        -- Configuracoes de otimizacao para o Mattermost
+        ALTER DATABASE ${MATTERMOST_DB} SET work_mem = '32MB';
+
+        -- Conceder permissoes no schema public
+        \c ${OPENPROJECT_DB}
+        GRANT ALL ON SCHEMA public TO ${OPENPROJECT_USER};
+
+        \c ${MATTERMOST_DB}
+        GRANT ALL ON SCHEMA public TO ${MATTERMOST_USER};
+
+        echo "=== Bancos de dados criados com sucesso ==="
+    EOSQL
+
+  # ---------------------------------------------------------------------------
+  # Configuracao otimizada do PostgreSQL para 4 GB RAM
+  # Arquivo postgresql.conf customizado
+  # ---------------------------------------------------------------------------
+  postgresql.conf: |
+    # --------------------------------------------------------------------------
+    # Configuracoes de conexao
+    # --------------------------------------------------------------------------
+    listen_addresses = '*'
+    max_connections = 100
+    superuser_reserved_connections = 3
+
+    # --------------------------------------------------------------------------
+    # Configuracoes de memoria (para 4 GB dedicados ao PostgreSQL)
+    # --------------------------------------------------------------------------
+    # shared_buffers: 25% da RAM = 1 GB
+    shared_buffers = 1GB
+    # effective_cache_size: 75% da RAM = 3 GB
+    effective_cache_size = 3GB
+    # maintenance_work_mem: para VACUUM, CREATE INDEX, etc.
+    maintenance_work_mem = 256MB
+    # work_mem: para operacoes de ordenacao (configurado por DB)
+    work_mem = 32MB
+
+    # --------------------------------------------------------------------------
+    # WAL (Write-Ahead Log)
+    # --------------------------------------------------------------------------
+    wal_buffers = 16MB
+    checkpoint_completion_target = 0.9
+    max_wal_size = 1GB
+    min_wal_size = 512MB
+
+    # --------------------------------------------------------------------------
+    # Configuracoes de query tuning
+    # --------------------------------------------------------------------------
+    random_page_cost = 1.1          # Mais baixo para SSDs da OCI
+    effective_io_concurrency = 200  # Para SSDs
+    default_statistics_target = 100
+
+    # --------------------------------------------------------------------------
+    # Logging
+    # --------------------------------------------------------------------------
+    log_destination = 'stderr'
+    logging_collector = off
+    log_min_duration_statement = 500  # Log queries com mais de 500ms
+    log_checkpoints = on
+    log_connections = on
+    log_disconnections = on
+    log_lock_waits = on
+
+    # --------------------------------------------------------------------------
+    # Autovacuum (importante para OpenProject)
+    # --------------------------------------------------------------------------
+    autovacuum = on
+    autovacuum_max_workers = 3
+    autovacuum_naptime = 1min
+
+    # --------------------------------------------------------------------------
+    # Extensions
+    # --------------------------------------------------------------------------
+    shared_preload_libraries = 'pg_stat_statements'
+    pg_stat_statements.track = all
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: incubadora
+type: Opaque
+stringData:
+  # Senha do superusuario PostgreSQL
+  # IMPORTANTE: Altere estas senhas antes do deploy!
+  POSTGRES_PASSWORD: "CHANGE_ME_GENERATE_STRONG_PASSWORD"
+  # Senha do usuario OpenProject
+  OPENPROJECT_PASSWORD: "CHANGE_ME_OPENPROJECT_DB_PASSWORD"
+  # Senha do usuario Mattermost
+  MATTERMOST_PASSWORD: "CHANGE_ME_MATTERMOST_DB_PASSWORD"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: incubadora
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # 50 GB para dados do PostgreSQL (no Free Tier, o volume total e limitado)
+      storage: 50Gi
+  # StorageClass padrao do K3s (geralmente local-path)
+  # Para Oracle Cloud Block Volume, use: oci-bv
+  storageClassName: local-path
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: incubadora
+spec:
+  serviceName: postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgresql
+        app.kubernetes.io/component: database
+      annotations:
+        # Restart automatico se o pod travar por OOM
+        prometheus.io/scrape: "false"
+    spec:
+      # Garantir que rode em no ARM64 (Oracle A1 Flex)
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      # Garantir que apenas 1 replica por no
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - postgresql
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: postgresql
+          image: postgres:17-bookworm
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: "postgres"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+            - name: OPENPROJECT_DB
+              value: "openproject"
+            - name: OPENPROJECT_USER
+              value: "openproject"
+            - name: OPENPROJECT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: OPENPROJECT_PASSWORD
+            - name: MATTERMOST_DB
+              value: "mattermost"
+            - name: MATTERMOST_USER
+              value: "mattermost"
+            - name: MATTERMOST_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: MATTERMOST_PASSWORD
+            - name: PGCONF
+              value: "/etc/postgresql/postgresql.conf"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d/init-multi-db.sh
+              subPath: init-multi-db.sh
+            - name: postgres-config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "1"
+              memory: 4Gi
+          # Health checks
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12  # Ate 120s para o PostgreSQL iniciar
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: postgres-init-scripts
+            defaultMode: 0755
+        - name: postgres-config
+          configMap:
+            name: postgres-init-scripts
+            items:
+              - key: postgresql.conf
+                path: postgresql.conf
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 50Gi
+        storageClassName: local-path
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: incubadora
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: database
+---
+# =============================================================================
+# NetworkPolicy - Allow PostgreSQL access from app namespaces + backup
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgresql-allow-cross-namespace
+  namespace: incubadora-infra
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: incubadora
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from OpenProject namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/component: openproject
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow from Mattermost namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/component: mattermost
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow from Backup namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/component: backup
+      ports:
+        - protocol: TCP
+          port: 5432

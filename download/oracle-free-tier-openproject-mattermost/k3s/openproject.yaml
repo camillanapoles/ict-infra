@@ -1,0 +1,415 @@
+# =============================================================================
+# openproject.yaml - OpenProject 15 — Namespace: incubadora-openproject
+# =============================================================================
+# Deployment do OpenProject 15 com:
+# - ConfigMap para variaveis de ambiente nao-sensiveis
+# - Secret para senhas e tokens sensiveis
+# - Service ClusterIP para acesso interno
+# - IngressRoute (Traefik) para acesso externo via dominio
+# - NetworkPolicy: egress to incubadora-infra (PostgreSQL:5432, Memcached:11211)
+# - Resources: 3 GB RAM, 1.5 CPU limit
+# - Health checks (liveness, readiness, startup)
+#
+# CROSS-NAMESPACE DEPENDENCIES:
+#   PostgreSQL: postgresql.incubadora-infra.svc.cluster.local:5432
+#   Memcached:  memcached.incubadora-infra.svc.cluster.local:11211
+#
+# ATENCAO: OpenProject nao possui imagem ARM64 nativa. Este manifesto
+# usa a imagem openproject/community com emulacao (qemu) via K3s.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openproject-config
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/component: project-management
+    app.kubernetes.io/part-of: incubadora
+data:
+  # ---------------------------------------------------------------------------
+  # Configuracoes gerais do OpenProject
+  # ---------------------------------------------------------------------------
+  OPENPROJECT_HOST__NAME: "projects.seudominio.com"
+  OPENPROJECT_HTTPS: "true"
+  OPENPROJECT_SECRET_KEY_BASE: ""  # Deve ser preenchido via Secret
+  OPENPROJECT_DEFAULT__LANGUAGE: "pt"
+
+  # ---------------------------------------------------------------------------
+  # Configuracoes do banco de dados PostgreSQL (CROSS-NAMESPACE)
+  # ---------------------------------------------------------------------------
+  OPENPROJECT_DB__HOST: "postgresql.incubadora-infra.svc.cluster.local"
+  OPENPROJECT_DB__PORT: "5432"
+  OPENPROJECT_DB__NAME: "openproject"
+  OPENPROJECT_DB__USERNAME: "openproject"
+
+  # ---------------------------------------------------------------------------
+  # Configuracoes de cache Memcached (CROSS-NAMESPACE)
+  # ---------------------------------------------------------------------------
+  OPENPROJECT_CACHE__MEMCACHE__SERVER: "memcached.incubadora-infra.svc.cluster.local:11211"
+
+  # ---------------------------------------------------------------------------
+  # Configuracoes de email (SMTP)
+  # ---------------------------------------------------------------------------
+  OPENPROJECT_EMAIL__DELIVERY__METHOD: "smtp"
+  OPENPROJECT_EMAIL__SMTP__ADDRESS: "smtp.seudominio.com"
+  OPENPROJECT_EMAIL__SMTP__PORT: "587"
+  OPENPROJECT_EMAIL__SMTP__DOMAIN: "seudominio.com"
+  OPENPROJECT_EMAIL__SMTP__AUTHENTICATION: "login"
+  OPENPROJECT_EMAIL__SMTP__ENABLE__STARTTLS__AUTO: "true"
+  OPENPROJECT_EMAIL__SMTP__USERNAME: "noreply@seudominio.com"
+
+  # ---------------------------------------------------------------------------
+  # Configuracoes de performance
+  # ---------------------------------------------------------------------------
+  OPENPROJECT_WEB__WORKERS: "2"
+  OPENPROJECT_BACKGROUND__WORKERS: "1"
+  OPENPROJECT_MAX__THREADS: "2"
+  RAILS_MAX_THREADS: "2"
+  RAILS_ENV: "production"
+
+  # ---------------------------------------------------------------------------
+  # Configuracoes de upload
+  # ---------------------------------------------------------------------------
+  OPENPROJECT_ATTACHMENT__MAX__FILE__SIZE: "52428800"  # 50 MB
+  OPENPROJECT_AVATAR__MAX__FILE__SIZE: "2097152"       # 2 MB
+
+  # ---------------------------------------------------------------------------
+  # Configuracoes de seguranca
+  # ---------------------------------------------------------------------------
+  OPENPROJECT_SESSION__STORE: "cache_store"
+  OPENPROJECT_COOKIE__PATH: "/"
+  OPENPROJECT_X__FRAME__OPTIONS: "SAMEORIGIN"
+  OPENPROJECT_CONTENT__SECURITY__POLICY: "frame-ancestors 'self'"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openproject-secret
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/component: project-management
+    app.kubernetes.io/part-of: incubadora
+type: Opaque
+stringData:
+  # ---------------------------------------------------------------------------
+  # IMPORTANTE: Altere estes valores antes do deploy!
+  # Gerar chave: openssl rand -hex 64
+  # ---------------------------------------------------------------------------
+  OPENPROJECT_SECRET_KEY_BASE: "CHANGE_ME_GENERATE_RANDOM_64_CHARS_SECRET_KEY"
+  # Senha do banco de dados (deve corresponder ao postgres-secret em incubadora-infra)
+  OPENPROJECT_DB__PASSWORD: "CHANGE_ME_OPENPROJECT_DB_PASSWORD"
+  # Senha do SMTP
+  OPENPROJECT_EMAIL__SMTP__PASSWORD: "CHANGE_ME_SMTP_PASSWORD"
+  # Senha do administrador (primeiro login)
+  OPENPROJECT_ADMIN__PASSWORD: "CHANGE_ME_ADMIN_PASSWORD"
+  # Email do administrador
+  OPENPROJECT_ADMIN__EMAIL: "admin@seudominio.com"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openproject
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/component: project-management
+    app.kubernetes.io/part-of: incubadora
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # Nao fazer rolling update (Stateful data)
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openproject
+      app.kubernetes.io/component: project-management
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openproject
+        app.kubernetes.io/component: project-management
+      annotations:
+        # Reiniciar se o configmap mudar
+        checksum/config: ""
+    spec:
+      # Garantir que rode em ARM64
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      initContainers:
+        # ----------------------------------------------------------------------
+        # Container de inicializacao - Aguarda o PostgreSQL (CROSS-NAMESPACE)
+        # ----------------------------------------------------------------------
+        - name: wait-for-postgres
+          image: postgres:17-bookworm
+          command:
+            - sh
+            - -c
+            - |
+              echo "Aguardando PostgreSQL em postgresql.incubadora-infra.svc.cluster.local:5432..."
+              until pg_isready -h postgresql.incubadora-infra.svc.cluster.local -p 5432 -U openproject; do
+                echo "PostgreSQL nao esta pronto. Aguardando 5s..."
+                sleep 5
+              done
+              echo "PostgreSQL esta pronto! Iniciando OpenProject..."
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      containers:
+        - name: openproject
+          image: openproject/community:15
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: openproject-config
+            - secretRef:
+                name: openproject-secret
+          # Sobrescrever configuracoes de seguranca com valores do Secret
+          env:
+            - name: OPENPROJECT_SECRET_KEY_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: openproject-secret
+                  key: OPENPROJECT_SECRET_KEY_BASE
+            - name: OPENPROJECT_DB__PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: openproject-secret
+                  key: OPENPROJECT_DB__PASSWORD
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "1.5"
+              memory: 3Gi
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /health_check
+              port: http
+            initialDelaySeconds: 120  # OpenProject demora para iniciar
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health_check
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health_check
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 20  # Ate 300s para o OpenProject iniciar (e pesado!)
+          volumeMounts:
+            - name: openproject-data
+              mountPath: /var/openproject/assets
+            - name: openproject-conf
+              mountPath: /etc/openproject/configuration.yml
+              subPath: configuration.yml
+              readOnly: true
+      volumes:
+        - name: openproject-data
+          persistentVolumeClaim:
+            claimName: openproject-data
+        - name: openproject-conf
+          configMap:
+            name: openproject-config
+            items:
+              - key: configuration.yml
+                path: configuration.yml
+---
+# PVC para dados do OpenProject (assets, attachments, etc.)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openproject-data
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/component: project-management
+    app.kubernetes.io/part-of: incubadora
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 30Gi
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openproject
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/component: project-management
+    app.kubernetes.io/part-of: incubadora
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/component: project-management
+---
+# =============================================================================
+# NetworkPolicy - Egress to infra namespace (PostgreSQL + Memcached)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openproject-egress-infra
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/component: project-management
+    app.kubernetes.io/part-of: incubadora
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openproject
+  policyTypes:
+    - Egress
+  egress:
+    # PostgreSQL in incubadora-infra
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/component: infrastructure
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Memcached in incubadora-infra
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/component: infrastructure
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: memcached
+      ports:
+        - protocol: TCP
+          port: 11211
+---
+# =============================================================================
+# NetworkPolicy - Allow ingress from Traefik (Ingress Controller)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openproject-allow-ingress
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/part-of: incubadora
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openproject
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from Traefik ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+        - ipBlock:
+            cidr: 10.42.0.0/16  # K3s pod network (fallback)
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# =============================================================================
+# IngressRoute Traefik - Roteamento para o OpenProject
+# =============================================================================
+# Configura o Traefik para rotear o trafego HTTPS para o OpenProject
+# Usa certificado Let's Encrypt via cert-manager (DNS-01 challenge com Cloudflare)
+# =============================================================================
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: openproject-http
+  namespace: incubadora-openproject
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`projects.seudominio.com`)
+      kind: Rule
+      middlewares:
+        - name: redirect-https
+          namespace: traefik
+      services:
+        - name: openproject
+          port: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: openproject-https
+  namespace: incubadora-openproject
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`projects.seudominio.com`)
+      kind: Rule
+      middlewares:
+        - name: openproject-security-headers
+        - name: openproject-compress
+      services:
+        - name: openproject
+          port: http
+  tls:
+    secretName: openproject-tls
+    domains:
+      - main: "projects.seudominio.com"
+---
+# Middleware para headers de seguranca
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: openproject-security-headers
+  namespace: incubadora-openproject
+spec:
+  headers:
+    frameDeny: false
+    customFrameOptionsValue: "SAMEORIGIN"
+    contentTypeNosniff: true
+    browserXssFilter: true
+    stsSeconds: 31536000
+    stsIncludeSubdomains: true
+    stsPreload: true
+    referrerPolicy: "strict-origin-when-cross-origin"
+    contentSecurityPolicy: "frame-ancestors 'self'"
+---
+# Middleware para compressao
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: openproject-compress
+  namespace: incubadora-openproject
+spec:
+  compress: {}

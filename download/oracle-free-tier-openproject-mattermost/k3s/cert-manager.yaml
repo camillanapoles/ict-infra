@@ -1,0 +1,163 @@
+# =============================================================================
+# cert-manager.yaml - ClusterIssuers + Certificates (Multi-Namespace)
+# =============================================================================
+# cert-manager configuration for automatic Let's Encrypt certificate issuance
+# using DNS-01 challenge via Cloudflare API.
+#
+# ARCHITECTURE:
+#   ClusterIssuers:  cert-manager namespace (cluster-scoped)
+#   Certificates:    Per-app namespaces (incubadora-openproject, incubadora-mattermost)
+#
+# VANTAGENS do DNS-01 sobre HTTP-01:
+#   1. Funciona mesmo com Cloudflare proxy (orange cloud) ativado
+#   2. Permite certificados wildcard (*.seudominio.com)
+#   3. Mais confiavel para automatizacao
+#   4. Nao requer que o servidor esteja acessivel pela internet
+#
+# REQUISITOS:
+#   1. cert-manager instalado (k3s/install-k3s.sh faz isso)
+#   2. Cloudflare API Token com Zone:DNS:Edit
+#   3. Secret com o API Token criado no namespace cert-manager
+#
+# PREPARACAO:
+#   kubectl create secret generic cloudflare-api-token \
+#     --from-literal=api-token=SEU_CLOUDFLARE_API_TOKEN \
+#     -n cert-manager
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Secret com Cloudflare API Token
+# IMPORTANTE: Altere o valor do api-token antes de aplicar!
+# Criar via comando:
+#   kubectl create secret generic cloudflare-api-token \
+#     --from-literal=api-token=SEU_TOKEN \
+#     --dry-run=client -o yaml | kubectl apply -f -
+# ---------------------------------------------------------------------------
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: cloudflare-api-token
+#   namespace: cert-manager
+# type: Opaque
+# stringData:
+#   api-token: "SEU_CLOUDFLARE_API_TOKEN"
+
+---
+# =============================================================================
+# ClusterIssuer - Let's Encrypt Production (cluster-scoped)
+# =============================================================================
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+  labels:
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/component: acme
+    app.kubernetes.io/part-of: incubadora
+spec:
+  acme:
+    # Email para notificacoes do Let's Encrypt (expiracao, problemas)
+    email: admin@seudominio.com
+    # Servidor de producao do Let's Encrypt
+    server: https://acme-v02.api.letsencrypt.org/directory
+    # Chave privada para a conta ACME (armazenada automaticamente)
+    privateKeySecretRef:
+      name: letsencrypt-prod-key
+    # DNS-01 Challenge via Cloudflare
+    solvers:
+      - dns01:
+          cloudflare:
+            # Token API do Cloudflare (metodo recomendado, mais seguro)
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+
+---
+# =============================================================================
+# ClusterIssuer - Let's Encrypt Staging (cluster-scoped)
+# =============================================================================
+# Emissor de certificados para testes (sem rate limits praticos)
+# NAO use em producao - os certificados sao invalidos (raiz nao confiavel)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+  labels:
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/component: acme
+    app.kubernetes.io/part-of: incubadora
+spec:
+  acme:
+    email: admin@seudominio.com
+    # Servidor de staging do Let's Encrypt
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-staging-key
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+
+---
+# =============================================================================
+# Certificate - OpenProject (incubadora-openproject namespace)
+# =============================================================================
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openproject-cert
+  namespace: incubadora-openproject
+  labels:
+    app.kubernetes.io/name: openproject
+    app.kubernetes.io/component: tls
+    app.kubernetes.io/part-of: incubadora
+spec:
+  # Nome do secreto onde o certificado sera armazenado
+  secretName: openproject-tls
+  # DNS names incluidos no certificado
+  dnsNames:
+    - "projects.seudominio.com"
+  # Issuer que vai emitir o certificado
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  # Renovacao automatica 30 dias antes da expiracao
+  renewBefore: 720h
+  usages:
+    - server auth
+    - client auth
+  keyAlgorithm: RSA
+  keySize: 2048
+  privateKey:
+    rotationPolicy: Always
+
+---
+# =============================================================================
+# Certificate - Mattermost (incubadora-mattermost namespace)
+# =============================================================================
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: mattermost-cert
+  namespace: incubadora-mattermost
+  labels:
+    app.kubernetes.io/name: mattermost
+    app.kubernetes.io/component: tls
+    app.kubernetes.io/part-of: incubadora
+spec:
+  secretName: mattermost-tls
+  dnsNames:
+    - "chat.seudominio.com"
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  renewBefore: 720h
+  usages:
+    - server auth
+    - client auth
+  keyAlgorithm: RSA
+  keySize: 2048
+  privateKey:
+    rotationPolicy: Always

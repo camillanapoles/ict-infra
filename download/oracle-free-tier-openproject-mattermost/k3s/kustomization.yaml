@@ -1,0 +1,60 @@
+# =============================================================================
+# kustomization.yaml — Kustomize Root Orchestration
+# =============================================================================
+# Kustomize configuration that references ALL project resources in the correct
+# deployment order. Each file is self-contained with its own namespace.
+#
+# Usage:
+#   kubectl apply -k .                  # Apply all resources
+#   kubectl kustomize . | less          # Preview all rendered resources
+#   kustomize build . > full-manifest.yaml  # Export combined manifest
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ---------------------------------------------------------------------------
+# Resources in strict deployment order
+# ---------------------------------------------------------------------------
+resources:
+  # 1. Namespaces (must exist before anything else)
+  - namespaces.yaml
+
+  # 2. Network Policies (security baseline — applied before workloads)
+  - network-policies.yaml
+
+  # 3. Infrastructure — shared services in incubadora-infra
+  - postgresql.yaml
+  - memcached.yaml
+
+  # 4. Certificates (before apps need TLS)
+  - cert-manager.yaml
+
+  # 5. Applications (depend on infra + certs)
+  - openproject.yaml
+  - mattermost.yaml
+
+  # 6. Backup (depends on infra being accessible)
+  - backup-cronjob.yaml
+
+# ---------------------------------------------------------------------------
+# Common labels applied to ALL resources
+# ---------------------------------------------------------------------------
+commonLabels:
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/part-of: incubadora
+  environment: production
+
+# ---------------------------------------------------------------------------
+# Common annotations
+# ---------------------------------------------------------------------------
+commonAnnotations:
+  incubadora.io/architecture: "single-node-k3s"
+  incubadora.io/platform: "oracle-a1-flex"
+
+# ---------------------------------------------------------------------------
+# Namespace override — applied only to resources WITHOUT a namespace
+# (resources with explicit namespace in their YAML are NOT overridden)
+# ---------------------------------------------------------------------------
+# We leave this empty because every resource defines its own namespace.
+# namespace: incubadora-openproject

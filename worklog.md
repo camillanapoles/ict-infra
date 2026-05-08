@@ -1,17 +1,43 @@
 ---
 Task ID: 1
 Agent: Main Agent
-Task: Projeto IaC completo — OpenProject + Mattermost — Oracle Cloud Free Tier
+Task: Criar apresentação interativa de arquitetura C4 + projeto GitHub Pages
 
 Work Log:
-- Analisou requisitos técnicos completos do documento anexado (OpenProject Enterprise v15 + Mattermost + Oracle Always Free)
-- Definiu arquitetura otimizada: 1 VM A1 Flex (4 OCPU / 24 GB), PostgreSQL 17 compartilhado, Nginx + Let's Encrypt
-- Mapeou todos os serviços Always Free aplicáveis (VCN, LB, Monitoring, Logging, Vault, Object Storage, WAF)
-- Criou 42 arquivos de projeto IaC end-to-end
-- Gerou ZIP do projeto completo
+- Analisou requisitos: duas entregas (arquitetura + apresentação interativa)
+- Invocou skills: charts (diagramas) + fullstack-dev (site)
+- Inicializou ambiente fullstack + charts
+- Atualizou globals.css com tema dark profissional (emerald/teal/amber)
+- Atualizou layout.tsx com dark mode e metadata
+- Criou 8 componentes interativos em src/components/arch/:
+  - Navigation.tsx (sticky nav com scroll spy)
+  - HeroSection.tsx (hero com gradientes e feature pills)
+  - ProblemSolution.tsx (antes vs depois comparativo)
+  - C4SystemContext.tsx (diagrama SVG interativo - Level 1)
+  - C4Container.tsx (diagrama SVG interativo - Level 2)
+  - C4Deployment.tsx (diagrama SVG interativo - Level 3)
+  - UserFlowSection.tsx (fluxo do usuário com casos de uso reais)
+  - TechSpecsSection.tsx (specs técnicas + domínios + alocação de recursos)
+  - Footer.tsx (footer profissional)
+- Criou page.tsx principal compondo todas as seções
+- Corrigiu lint error (import X do lucide-react)
+- Verificou dev server compilando sem erros
+- Criou projeto standalone GitHub Pages com:
+  - next.config.js (output: 'export' para static)
+  - package.json (dependências compatíveis)
+  - tsconfig.json, tailwind.config.js, postcss.config.js
+  - globals.css (Tailwind v3 compatible)
+  - layout.tsx e page.tsx adaptados
+  - Todos os 8 componentes copiados
+  - .github/workflows/deploy.yml (GitHub Actions para Pages)
+  - .gitignore
+  - README.md com instruções completas
+- Gerou ZIP: incubadora-platform-architecture.zip
 
 Stage Summary:
-- 42 arquivos criados em 4 módulos principais: Terraform (12), Docker (10), GitHub Actions (6), Scripts (10), Config (4)
-- ZIP gerado: oracle-free-tier-openproject-mattermost.zip (129 KB)
-- Projeto pronto para deploy: clone → configure .env → terraform apply → deploy-stack
-- Arquitetura usa 100% Always Free: custo mensal R$ 0,00
+- Apresentação interativa funcionando no preview (Next.js dark theme)
+- Diagramas C4 interativos com hover/click e painel de detalhes
+- Fluxo do usuário com 4 fases x 2 steps (antes vs depois)
+- Comparação de métricas de impacto
+- Projeto GitHub Pages pronto para deploy com Actions
+- ZIP gerado em /home/z/my-project/download/incubadora-platform-architecture.zip
