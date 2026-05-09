@@ -1,0 +1,78 @@
+# =============================================================================
+# GitHub Pages Deployment Workflow
+# Builds the Next.js static export (src/) and publishes it to GitHub Pages.
+# =============================================================================
+
+name: "Deploy Pages"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "public/**"
+      - "next.config.js"
+      - "package.json"
+      - "tailwind.config.js"
+      - "postcss.config.js"
+      - "tsconfig.json"
+      - ".github/workflows/pages.yml"
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+# Only one Pages deploy at a time; queue new runs instead of cancelling
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build Next.js static export
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build static export
+        run: npm run build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Deploy to GitHub Pages
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "Deploy"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
