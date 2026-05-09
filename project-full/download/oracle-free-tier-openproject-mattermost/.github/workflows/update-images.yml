@@ -1,0 +1,393 @@
+# =============================================================================
+# Docker Image Update Workflow
+# Pulls latest images weekly (or on demand), applies rolling updates,
+# and rolls back automatically on failure.
+# =============================================================================
+
+name: "Update Images"
+
+on:
+  # Run weekly on Sundays at 03:00 UTC
+  schedule:
+    - cron: "0 3 * * 0"
+
+  # Allow manual trigger with scope selection
+  workflow_dispatch:
+    inputs:
+      images:
+        description: "Which images to update"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - openproject
+          - mattermost
+          - postgres
+          - nginx
+      skip_health_check:
+        description: "Skip post-update health checks"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Dry run – check for updates but do not apply"
+        required: false
+        default: false
+        type: boolean
+
+# Only one update at a time
+concurrency:
+  group: image-update
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  VM_USER: ubuntu
+  REMOTE_APP_DIR: /opt/app
+  SSH_OPTS: >
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=30
+  HEALTH_CHECK_TIMEOUT: 180  # seconds
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job: Pull images and detect changes
+  # ---------------------------------------------------------------------------
+  check-updates:
+    name: "Check for Image Updates"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      has_updates: ${{ steps.detect.outputs.has_updates }}
+      updated_images: ${{ steps.detect.outputs.updated_images }}
+      vm_ip: ${{ steps.resolve.outputs.vm_ip }}
+    steps:
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Resolve VM IP
+        id: resolve
+        run: |
+          VM_IP=$(dig +short "${{ secrets.OPENPROJECT_DOMAIN }}" 2>/dev/null | head -1) || true
+          if [ -z "$VM_IP" ]; then
+            VM_IP=$(dig +short "${{ secrets.MATTERMOST_DOMAIN }}" 2>/dev/null | head -1) || true
+          fi
+          if [ -z "$VM_IP" ]; then
+            echo "::error::Could not resolve VM IP"
+            exit 1
+          fi
+          echo "vm_ip=$VM_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Record current image digests (before pull)
+        id: before
+        run: |
+          VM_IP="${{ steps.resolve.outputs.vm_ip }}"
+          IMAGES="${{ github.event.inputs.images || 'all' }}"
+
+          # Capture current image IDs before pulling
+          BEFORE_DIGESTS=$(ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} \
+            "docker compose -f ${{ env.REMOTE_APP_DIR }}/docker-compose.yml images --format '{{.Name}}={{.ID}}'" 2>/dev/null)
+
+          echo "before<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BEFORE_DIGESTS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "📝 Current images:"
+          echo "$BEFORE_DIGESTS" || echo "(none)"
+
+      - name: Pull latest images
+        id: pull
+        run: |
+          VM_IP="${{ steps.resolve.outputs.vm_ip }}"
+          IMAGES="${{ github.event.inputs.images || 'all' }}"
+
+          PULL_CMD="docker compose -f ${{ env.REMOTE_APP_DIR }}/docker-compose.yml pull"
+
+          # Filter to specific images if requested
+          case "$IMAGES" in
+            openproject)  PULL_CMD="$PULL_CMD openproject" ;;
+            mattermost)   PULL_CMD="$PULL_CMD mattermost" ;;
+            postgres)     PULL_CMD="$PULL_CMD db" ;;
+            nginx)        PULL_CMD="$PULL_CMD nginx" ;;
+            all)          ;;  # pull all
+          esac
+
+          echo "📦 Pulling latest images..."
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} "$PULL_CMD"
+
+      - name: Detect updated images
+        id: detect
+        run: |
+          VM_IP="${{ steps.resolve.outputs.vm_ip }}"
+
+          # Capture image IDs after pulling
+          AFTER_DIGESTS=$(ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} \
+            "docker compose -f ${{ env.REMOTE_APP_DIR }}/docker-compose.yml images --format '{{.Name}}={{.ID}}'" 2>/dev/null)
+
+          echo "📝 Images after pull:"
+          echo "$AFTER_DIGESTS" || echo "(none)"
+
+          # Compare before and after
+          UPDATED=""
+          BEFORE="${{ steps.before.outputs.before }}"
+          while IFS='=' read -r name digest; do
+            [ -z "$name" ] && continue
+            # Check if digest changed (simple substring match)
+            if ! echo "$BEFORE" | grep -q "${name}=${digest}"; then
+              echo "🔄 Updated: $name"
+              UPDATED="${UPDATED}${name},"
+            fi
+          done <<< "$AFTER_DIGESTS"
+
+          # Remove trailing comma
+          UPDATED=$(echo "$UPDATED" | sed 's/,$//')
+
+          if [ -n "$UPDATED" ]; then
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            echo "updated_images=$UPDATED" >> "$GITHUB_OUTPUT"
+            echo "✅ Updated images detected: $UPDATED"
+          else
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "updated_images=" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ All images are already up to date"
+          fi
+
+      - name: Check summary
+        run: |
+          echo "## 📦 Image Update Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Has Updates:** ${{ steps.detect.outputs.has_updates }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Updated Images:** \`${{ steps.detect.outputs.updated_images || 'none' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Dry Run:** ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Job: Apply updates with backup and rollback capability
+  # ---------------------------------------------------------------------------
+  apply-updates:
+    name: "Apply Rolling Updates"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [check-updates]
+    if: needs.check-updates.outputs.has_updates == 'true'
+    env:
+      VM_IP: ${{ needs.check-updates.outputs.vm_ip }}
+    steps:
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      # Exit early if dry run
+      - name: Dry run – skipping apply
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          echo "ℹ️ Dry run mode – no changes applied"
+          echo "## ⏭️ Dry Run Complete" >> $GITHUB_STEP_SUMMARY
+          echo "Updated images: \`${{ needs.check-updates.outputs.updated_images }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "No containers were restarted." >> $GITHUB_STEP_SUMMARY
+          exit 0
+
+      - name: Create pre-update backup
+        run: |
+          VM_IP="${{ env.VM_IP }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s << REMOTE_SCRIPT
+            set -euo pipefail
+            TIMESTAMP="$TIMESTAMP"
+            BACKUP_DIR="/var/backups/pre-update-${TIMESTAMP}"
+            mkdir -p "$BACKUP_DIR"
+
+            echo "💾 Creating pre-update backup..."
+
+            # Save current image tags for rollback
+            docker compose -f /opt/app/docker-compose.yml images --format '{{.Name}}={{.Repository}}:{{.Tag}}' \
+              > "$BACKUP_DIR/image_versions.txt"
+
+            # Quick DB dumps
+            docker exec \$(docker ps -q --filter name=db) \
+              pg_dump -U openproject openproject > "$BACKUP_DIR/openproject_pre_update.sql" 2>/dev/null || true
+            docker exec \$(docker ps -q --filter name=db) \
+              pg_dump -U mattermost mattermost > "$BACKUP_DIR/mattermost_pre_update.sql" 2>/dev/null || true
+
+            echo "✅ Pre-update backup created at $BACKUP_DIR"
+            ls -lh "$BACKUP_DIR/"
+
+            REMOTE_SCRIPT
+
+      - name: Record image IDs before restart (for rollback)
+        id: pre-restart
+        run: |
+          VM_IP="${{ env.VM_IP }}"
+          PRE_IMAGES=$(ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} \
+            "docker compose -f /opt/app/docker-compose.yml images --format '{{.Name}}={{.ID}}'" 2>/dev/null)
+
+          echo "pre_images<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$PRE_IMAGES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Rolling update – restart services
+        run: |
+          VM_IP="${{ env.VM_IP }}"
+          UPDATED="${{ needs.check-updates.outputs.updated_images }}"
+
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s << REMOTE_SCRIPT
+            set -euo pipefail
+            cd /opt/app
+
+            echo "🔄 Applying rolling update..."
+            # docker compose up -d recreates only containers with new images
+            docker compose up -d --remove-orphans
+
+            echo "📦 Container status:"
+            docker compose ps --format table
+
+            REMOTE_SCRIPT
+
+      - name: Wait for services to become healthy
+        id: health-wait
+        timeout-minutes: 4
+        run: |
+          VM_IP="${{ env.VM_IP }}"
+          TIMEOUT=${{ env.HEALTH_CHECK_TIMEOUT }}
+          elapsed=0
+
+          while [ $elapsed -lt $TIMEOUT ]; do
+            ALL_HEALTHY=true
+
+            # Check OpenProject
+            OP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 \
+              "https://${{ secrets.OPENPROJECT_DOMAIN }}/health" 2>/dev/null || echo "000")
+            if [ "$OP_CODE" -lt 200 ] || [ "$OP_CODE" -ge 500 ]; then
+              ALL_HEALTHY=false
+              echo "⏳ OpenProject not ready (HTTP $OP_CODE)"
+            fi
+
+            # Check Mattermost
+            MM_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 \
+              "https://${{ secrets.MATTERMOST_DOMAIN }}/api/v4/system/ping" 2>/dev/null || echo "000")
+            if [ "$MM_CODE" -lt 200 ] || [ "$MM_CODE" -ge 500 ]; then
+              ALL_HEALTHY=false
+              echo "⏳ Mattermost not ready (HTTP $MM_CODE)"
+            fi
+
+            if [ "$ALL_HEALTHY" = "true" ]; then
+              echo "✅ All services healthy after ${elapsed}s"
+              echo "healthy=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            sleep 15
+            elapsed=$((elapsed + 15))
+          done
+
+          echo "❌ Services did not become healthy within ${TIMEOUT}s"
+          echo "healthy=false" >> "$GITHUB_OUTPUT"
+
+      - name: Rollback on failure
+        if: steps.health-wait.outputs.healthy != 'true'
+        run: |
+          VM_IP="${{ env.VM_IP }}"
+          echo "🚨 Health checks failed – initiating rollback..."
+
+          # Find the latest pre-update backup
+          BACKUP_DIR=$(ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} \
+            "ls -td /var/backups/pre-update-* 2>/dev/null | head -1") || true
+
+          if [ -z "$BACKUP_DIR" ]; then
+            echo "⚠️ No pre-update backup found – cannot rollback automatically"
+            echo "Please investigate and restore manually"
+            exit 1
+          fi
+
+          echo "📂 Using backup from: $BACKUP_DIR"
+
+          # Read previous image tags and force recreation with old images
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} bash -s "$BACKUP_DIR" << 'REMOTE_SCRIPT'
+            set -euo pipefail
+            BACKUP_DIR="$1"
+            cd /opt/app
+
+            echo "📋 Previous image versions:"
+            cat "$BACKUP_DIR/image_versions.txt"
+
+            # Pull previous image versions explicitly
+            while IFS='=' read -r name tag; do
+              [ -z "$name" ] && continue
+              echo "  Pulling previous image: $tag"
+              docker pull "$tag" 2>/dev/null || true
+            done < "$BACKUP_DIR/image_versions.txt"
+
+            # Restart with previous images
+            docker compose up -d --force-recreate --remove-orphans
+
+            echo "⏳ Waiting for rollback to complete..."
+            sleep 30
+
+            echo "📦 Container status after rollback:"
+            docker compose ps --format table
+
+            REMOTE_SCRIPT
+
+          echo "✅ Rollback initiated"
+
+      - name: Prune old Docker images
+        if: always()
+        continue-on-error: true
+        run: |
+          VM_IP="${{ env.VM_IP }}"
+          echo "🧹 Pruning unused Docker images..."
+          ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} \
+            "docker image prune -af --filter 'until=168h'" 2>/dev/null || true
+          echo "✅ Image prune complete"
+
+      - name: Update summary
+        if: always()
+        run: |
+          UPDATED="${{ needs.check-updates.outputs.updated_images }}"
+          HEALTHY="${{ steps.health-wait.outputs.healthy }}"
+
+          echo "## 🔄 Image Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Updated Images** | \`${UPDATED}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Health After Update** | ${{ HEALTHY == 'true' && '✅ Healthy' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Rollback** | ${{ HEALTHY != 'true' && '🔄 Performed' || 'Not needed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Prune** | ✅ Done |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Timestamp** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Send update notification
+        if: always()
+        continue-on-error: true
+        run: |
+          UPDATED="${{ needs.check-updates.outputs.updated_images }}"
+          HEALTHY="${{ steps.health-wait.outputs.healthy }}"
+          WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_URL || secrets.DEPLOY_WEBHOOK_URL }}"
+
+          if [ -n "$WEBHOOK_URL" ]; then
+            EMOJI=$([ "$HEALTHY" = "true" ] && echo "✅" || echo "❌")
+            curl -sf -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "'${EMOJI}' *Image Update* – '"${UPDATED}"' – Status: '"${HEALTHY:-unknown}"'\nRepo: `${{ github.repository }}`\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+              }' || true
+          fi

@@ -1,6 +1,5 @@
 'use client';
 
-import { motion } from 'framer-motion';
 import Navigation from '@/components/arch/Navigation';
 import HeroSection from '@/components/arch/HeroSection';
 import ProblemSection from '@/components/arch/ProblemSolution';
