@@ -1,0 +1,395 @@
+# =============================================================================
+# Monitoring & Self-Healing Workflow
+# Runs every 15 minutes to check service health, SSL expiry, and disk space.
+# Attempts automatic recovery before alerting.
+# =============================================================================
+
+name: "Monitoring"
+
+on:
+  # Check every 15 minutes
+  schedule:
+    - cron: "*/15 * * * *"
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      verbose:
+        description: "Enable verbose output"
+        required: false
+        default: false
+        type: boolean
+
+# Only one monitoring run at a time
+concurrency:
+  group: monitoring
+  cancel-in-progress: true   # discard overlapping runs
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  VM_USER: ubuntu
+  SSH_OPTS: >
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=15
+  SSL_WARN_DAYS: 30
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job: Run all health checks
+  # ---------------------------------------------------------------------------
+  health-checks:
+    name: "Health Checks"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      openproject_status: ${{ steps.check-op.outputs.status }}
+      mattermost_status: ${{ steps.check-mm.outputs.status }}
+      ssl_status: ${{ steps.check-ssl.outputs.status }}
+      disk_status: ${{ steps.check-disk.outputs.status }}
+      vm_status: ${{ steps.check-vm.outputs.status }}
+      any_failed: ${{ steps.aggregate.outputs.any_failed }}
+    steps:
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      # ----- VM connectivity via OCI API -----
+      - name: Check VM instance status
+        id: check-vm
+        continue-on-error: true
+        run: |
+          VM_IP=$(dig +short "${{ secrets.OPENPROJECT_DOMAIN }}" 2>/dev/null | head -1) || true
+          if [ -z "$VM_IP" ]; then
+            VM_IP=$(dig +short "${{ secrets.MATTERMOST_DOMAIN }}" 2>/dev/null | head -1) || true
+          fi
+
+          if [ -z "$VM_IP" ]; then
+            echo "::warning::Could not resolve VM IP from domains"
+            echo "status=unknown" >> "$GITHUB_OUTPUT"
+            echo "vm_ip=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "vm_ip=$VM_IP" >> "$GITHUB_OUTPUT"
+
+          # Basic SSH connectivity test
+          if ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+              ${{ env.VM_USER }}@${VM_IP} "uptime" 2>/dev/null; then
+            echo "status=healthy" >> "$GITHUB_OUTPUT"
+            echo "✅ VM is running and reachable"
+          else
+            echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+            echo "❌ VM is unreachable"
+          fi
+
+      # ----- OpenProject health -----
+      - name: Check OpenProject health
+        id: check-op
+        continue-on-error: true
+        if: steps.check-vm.outputs.status == 'healthy' || steps.check-vm.outputs.status == ''
+        run: |
+          OP_DOMAIN="${{ secrets.OPENPROJECT_DOMAIN }}"
+          HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+            --max-time 15 \
+            "https://${OP_DOMAIN}/health" 2>/dev/null || echo "000")
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
+            echo "status=healthy" >> "$GITHUB_OUTPUT"
+            echo "✅ OpenProject: HTTP $HTTP_CODE"
+          else
+            echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+            echo "❌ OpenProject: HTTP $HTTP_CODE"
+          fi
+
+      # ----- Mattermost health -----
+      - name: Check Mattermost health
+        id: check-mm
+        continue-on-error: true
+        if: steps.check-vm.outputs.status == 'healthy' || steps.check-vm.outputs.status == ''
+        run: |
+          MM_DOMAIN="${{ secrets.MATTERMOST_DOMAIN }}"
+          HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+            --max-time 15 \
+            "https://${MM_DOMAIN}/api/v4/system/ping" 2>/dev/null || echo "000")
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
+            echo "status=healthy" >> "$GITHUB_OUTPUT"
+            echo "✅ Mattermost: HTTP $HTTP_CODE"
+          else
+            echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+            echo "❌ Mattermost: HTTP $HTTP_CODE"
+          fi
+
+      # ----- SSL certificate expiry -----
+      - name: Check SSL certificate expiry
+        id: check-ssl
+        continue-on-error: true
+        run: |
+          WARN_DAYS=${{ env.SSL_WARN_DAYS }}
+          FAILED=0
+          WARNINGS=""
+
+          for domain in "${{ secrets.OPENPROJECT_DOMAIN }}" "${{ secrets.MATTERMOST_DOMAIN }}"; do
+            EXPIRY=$(echo | openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null \
+              | openssl x509 -noout -enddate 2>/dev/null \
+              | cut -d= -f2)
+
+            if [ -z "$EXPIRY" ]; then
+              WARNINGS="${WARNINGS}⚠️ $domain: Could not read certificate\\n"
+              FAILED=1
+              continue
+            fi
+
+            EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s 2>/dev/null || echo 0)
+            NOW_EPOCH=$(date +%s)
+            DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+
+            if [ "$DAYS_LEFT" -lt 0 ]; then
+              WARNINGS="${WARNINGS}🔴 $domain: EXPIRED ($EXPIRY)\\n"
+              FAILED=1
+            elif [ "$DAYS_LEFT" -lt "$WARN_DAYS" ]; then
+              WARNINGS="${WARNINGS}🟡 $domain: ${DAYS_LEFT}d remaining (expires $EXPIRY)\\n"
+              FAILED=1
+            else
+              echo "✅ $domain: ${DAYS_LEFT} days remaining"
+            fi
+          done
+
+          if [ "$FAILED" -eq 0 ]; then
+            echo "status=healthy" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=warning" >> "$GITHUB_OUTPUT"
+            echo -e "$WARNINGS"
+          fi
+
+      # ----- Disk space check -----
+      - name: Check disk space on VM
+        id: check-disk
+        continue-on-error: true
+        if: steps.check-vm.outputs.status == 'healthy'
+        run: |
+          VM_IP="${{ steps.check-vm.outputs.vm_ip }}"
+          THRESHOLD=80  # percent
+
+          DISK_OUTPUT=$(ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+            ${{ env.VM_USER }}@${VM_IP} \
+            "df -h / /opt 2>/dev/null | awk 'NR>1'" 2>/dev/null || echo "")
+
+          if [ -z "$DISK_OUTPUT" ]; then
+            echo "status=unknown" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Could not read disk info"
+            exit 0
+          fi
+
+          echo "$DISK_OUTPUT"
+          OVER_THRESHOLD=$(echo "$DISK_OUTPUT" | awk -v t="$THRESHOLD" '$5+0 > t {print $6 " at " $5}')
+
+          if [ -z "$OVER_THRESHOLD" ]; then
+            echo "status=healthy" >> "$GITHUB_OUTPUT"
+            echo "✅ Disk usage within threshold ($THRESHOLD%)"
+          else
+            echo "status=warning" >> "$GITHUB_OUTPUT"
+            echo "⚠️ High disk usage: $OVER_THRESHOLD"
+          fi
+
+      # ----- Aggregate results -----
+      - name: Aggregate check results
+        id: aggregate
+        run: |
+          FAILED="false"
+          DETAILS=""
+
+          for check in vm op mm ssl disk; do
+            STATUS="${{ steps.check-${check}.outputs.status }}"
+            LABEL=$(echo "$check" | sed 's/\b\(.\)/\u\1/g')
+            case "$check" in
+              op) LABEL="OpenProject" ;;
+              mm) LABEL="Mattermost" ;;
+              vm) LABEL="VM" ;;
+              ssl) LABEL="SSL" ;;
+              disk) LABEL="Disk" ;;
+            esac
+
+            if [ "$STATUS" = "healthy" ]; then
+              DETAILS="${DETAILS}| ${LABEL} | ✅ Healthy |\\n"
+            elif [ "$STATUS" = "warning" ]; then
+              DETAILS="${DETAILS}| ${LABEL} | ⚠️ Warning |\\n"
+              FAILED="true"
+            elif [ "$STATUS" = "unhealthy" ]; then
+              DETAILS="${DETAILS}| ${LABEL} | ❌ Unhealthy |\\n"
+              FAILED="true"
+            else
+              DETAILS="${DETAILS}| ${LABEL} | ❓ Unknown |\\n"
+            fi
+          done
+
+          echo "any_failed=$FAILED" >> "$GITHUB_OUTPUT"
+
+          echo "## 🔍 Health Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo -e "$DETAILS" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Job: Self-healing (attempt recovery)
+  # ---------------------------------------------------------------------------
+  self-heal:
+    name: "Self-Healing"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [health-checks]
+    if: needs.health-checks.outputs.any_failed == 'true'
+    outputs:
+      heal_success: ${{ steps.heal.outputs.success }}
+    steps:
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Attempt service recovery
+        id: heal
+        run: |
+          VM_IP=$(dig +short "${{ secrets.OPENPROJECT_DOMAIN }}" 2>/dev/null | head -1)
+          SUCCESS="true"
+
+          # Restart OpenProject if unhealthy
+          if [ "${{ needs.health-checks.outputs.openproject_status }}" = "unhealthy" ]; then
+            echo "🔄 Restarting OpenProject containers..."
+            ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+              ${{ env.VM_USER }}@${VM_IP} \
+              "docker compose -f /opt/app/docker-compose.yml restart openproject" 2>/dev/null || SUCCESS="false"
+            sleep 30
+          fi
+
+          # Restart Mattermost if unhealthy
+          if [ "${{ needs.health-checks.outputs.mattermost_status }}" = "unhealthy" ]; then
+            echo "🔄 Restarting Mattermost containers..."
+            ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+              ${{ env.VM_USER }}@${VM_IP} \
+              "docker compose -f /opt/app/docker-compose.yml restart mattermost" 2>/dev/null || SUCCESS="false"
+            sleep 30
+          fi
+
+          # Restart nginx if both are down (might be a reverse proxy issue)
+          if [ "${{ needs.health-checks.outputs.openproject_status }}" = "unhealthy" ] && \
+             [ "${{ needs.health-checks.outputs.mattermost_status }}" = "unhealthy" ]; then
+            echo "🔄 Both services down – restarting nginx..."
+            ssh ${{ env.SSH_OPTS }} -i ~/.ssh/deploy_key \
+              ${{ env.VM_USER }}@${VM_IP} \
+              "docker compose -f /opt/app/docker-compose.yml restart nginx" 2>/dev/null || true
+            sleep 15
+          fi
+
+          # Re-check after healing
+          echo "🔍 Re-checking services after recovery..."
+          OP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 15 \
+            "https://${{ secrets.OPENPROJECT_DOMAIN }}/health" 2>/dev/null || echo "000")
+          MM_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 15 \
+            "https://${{ secrets.MATTERMOST_DOMAIN }}/api/v4/system/ping" 2>/dev/null || echo "000")
+
+          echo "  OpenProject: HTTP $OP_CODE"
+          echo "  Mattermost: HTTP $MM_CODE"
+
+          if [ "$OP_CODE" -lt 200 ] || [ "$OP_CODE" -ge 500 ]; then
+            SUCCESS="false"
+          fi
+          if [ "$MM_CODE" -lt 200 ] || [ "$MM_CODE" -ge 500 ]; then
+            SUCCESS="false"
+          fi
+
+          echo "success=$SUCCESS" >> "$GITHUB_OUTPUT"
+
+          if [ "$SUCCESS" = "true" ]; then
+            echo "## 🩹 Self-Healing Successful" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## 🩹 Self-Healing Attempted – Still Failing" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job: Create alert issue and send notifications
+  # ---------------------------------------------------------------------------
+  alert:
+    name: "Create Alert"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [health-checks, self-heal]
+    if: failure() || needs.self-heal.outputs.heal_success == 'false'
+    steps:
+      - name: Create GitHub issue for alert
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const title = `🚨 Service Alert – ${new Date().toISOString().slice(0, 16)}`;
+            const body = [
+              `## Automated Monitoring Alert`,
+              ``,
+              `| Service | Status |`,
+              `|---------|--------|`,
+              `| OpenProject | ${{ needs.health-checks.outputs.openproject_status }} |`,
+              `| Mattermost | ${{ needs.health-checks.outputs.mattermost_status }} |`,
+              `| SSL | ${{ needs.health-checks.outputs.ssl_status }} |`,
+              `| Disk | ${{ needs.health-checks.outputs.disk_status }} |`,
+              `| VM | ${{ needs.health-checks.outputs.vm_status }} |`,
+              ``,
+              `**Self-healing attempted:** ${{ needs.self-heal.result }}`,
+              ``,
+              `---`,
+              `*This issue was auto-created by the [monitoring workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).*`,
+              ``,
+              `### Next Steps`,
+              `- [ ] Review logs: \`${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\``,
+              `- [ ] SSH into VM and check Docker containers: \`docker compose ps\``,
+              `- [ ] Check Oracle Cloud console for VM status`,
+              `- [ ] If SSL is expiring, run certbot renew`,
+            ].join('\n');
+
+            // Avoid duplicate open alerts (only create if none open in last 2 hours)
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'automated-alert,monitoring',
+              state: 'open',
+              per_page: 5,
+            });
+
+            const recent = issues.filter(i => {
+              const age = Date.now() - new Date(i.created_at).getTime();
+              return age < 2 * 60 * 60 * 1000; // 2 hours
+            });
+
+            if (recent.length > 0) {
+              console.log(`Skipping issue creation – ${recent.length} recent alert(s) already open`);
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['automated-alert', 'monitoring', 'bug'],
+            });
+
+      - name: Send alert notification
+        run: |
+          WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_URL || secrets.ALERT_WEBHOOK_URL || secrets.DEPLOY_WEBHOOK_URL }}"
+          if [ -n "$WEBHOOK_URL" ]; then
+            curl -sf -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "🚨 *Service Alert*\nOpenProject: ${{ needs.health-checks.outputs.openproject_status }}\nMattermost: ${{ needs.health-checks.outputs.mattermost_status }}\nSSL: ${{ needs.health-checks.outputs.ssl_status }}\nDisk: ${{ needs.health-checks.outputs.disk_status }}\nSelf-heal: ${{ needs.self-heal.outputs.heal_success }}\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+              }' || true
+          fi
