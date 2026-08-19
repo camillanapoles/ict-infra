@@ -146,12 +146,12 @@ export default function C4SystemContext() {
   // Node positions (responsive-friendly centered layout)
   const nodes = {
     platform: { x: 340, y: 200, w: 220, h: 80 },
-    equipe:   { x: 80,  y: 80,  w: 200, h: 70 },
-    admin:    { x: 80,  y: 340, w: 200, h: 70 },
-    dns:      { x: 660, y: 40,  w: 200, h: 70 },
-    email:    { x: 660, y: 200, w: 200, h: 70 },
-    storage:  { x: 660, y: 360, w: 200, h: 70 },
-    landing:  { x: 340, y: 400, w: 220, h: 70 },
+    equipe: { x: 80, y: 80, w: 200, h: 70 },
+    admin: { x: 80, y: 340, w: 200, h: 70 },
+    dns: { x: 660, y: 40, w: 200, h: 70 },
+    email: { x: 660, y: 200, w: 200, h: 70 },
+    storage: { x: 660, y: 360, w: 200, h: 70 },
+    landing: { x: 340, y: 400, w: 220, h: 70 },
   };
 
   return (
@@ -171,7 +171,7 @@ export default function C4SystemContext() {
             Contexto do <span className="text-emerald-400">Sistema</span>
           </h2>
           <p className="text-slate-400 max-w-2xl mx-auto text-lg">
-            Visao macro da plataforma no contexto de usuarios, sistemas externos e 
+            Visao macro da plataforma no contexto de usuarios, sistemas externos e
             atores. Clique em cada elemento para ver detalhes.
           </p>
         </motion.div>
@@ -222,39 +222,39 @@ export default function C4SystemContext() {
               {/* Nodes */}
               <C4Node id="equipe" label="Equipe de Startups" icon={Users}
                 x={nodes.equipe.x} y={nodes.equipe.y}
-                w={nodes.equipe.w} h={nodes.equipe.h}
+                width={nodes.equipe.w} height={nodes.equipe.h}
                 color="#3B82F6" bgColor="rgba(59,130,246,0.08)"
                 active={activeNode === 'equipe'} onClick={() => setActiveNode(activeNode === 'equipe' ? null : 'equipe')} />
               <C4Node id="admin" label="Administrador" icon={Shield}
                 x={nodes.admin.x} y={nodes.admin.y}
-                w={nodes.admin.w} h={nodes.admin.h}
+                width={nodes.admin.w} height={nodes.admin.h}
                 color="#F59E0B" bgColor="rgba(245,158,11,0.08)"
                 active={activeNode === 'admin'} onClick={() => setActiveNode(activeNode === 'admin' ? null : 'admin')} />
               <C4Node id="platform" label="Plataforma Incubadora" icon={Monitor}
                 x={nodes.platform.x} y={nodes.platform.y}
-                w={nodes.platform.w} h={nodes.platform.h}
+                width={nodes.platform.w} height={nodes.platform.h}
                 color="#10B981" bgColor="rgba(16,185,129,0.12)"
                 active={activeNode === 'platform'} onClick={() => setActiveNode(activeNode === 'platform' ? null : 'platform')} />
               <C4Node id="dns" label="CDN / DNS Proxy" icon={Globe}
                 x={nodes.dns.x} y={nodes.dns.y}
-                w={nodes.dns.w} h={nodes.dns.h}
+                width={nodes.dns.w} height={nodes.dns.h}
                 color="#64748B" bgColor="rgba(100,116,139,0.08)"
                 active={activeNode === 'dns'} onClick={() => setActiveNode(activeNode === 'dns' ? null : 'dns')} />
               <C4Node id="email" label="Servidor de Email" icon={Mail}
                 x={nodes.email.x} y={nodes.email.y}
-                w={nodes.email.w} h={nodes.email.h}
+                width={nodes.email.w} height={nodes.email.h}
                 color="#EC4899" bgColor="rgba(236,72,153,0.08)"
                 active={activeNode === 'email'} onClick={() => setActiveNode(activeNode === 'email' ? null : 'email')} />
               <C4Node id="storage" label="Object Storage (S3)" icon={Database}
                 x={nodes.storage.x} y={nodes.storage.y}
-                w={nodes.storage.w} h={nodes.storage.h}
+                width={nodes.storage.w} height={nodes.storage.h}
                 color="#F59E0B" bgColor="rgba(245,158,11,0.08)"
                 active={activeNode === 'storage'} onClick={() => setActiveNode(activeNode === 'storage' ? null : 'storage')} />
               <C4Node id="landing" label="Landing Page" icon={Globe}
                 x={nodes.landing.x} y={nodes.landing.y}
-                w={nodes.landing.w} h={nodes.landing.h}
-                color="#8B5CF6" bgColor="rgba(139,92,246,0.08)"
-                active={activeNode === 'landing'} onClick={() => setActiveNode(activeNode === 'landing' ? null : 'landing')} />
+                width={nodes.landing.w} height={nodes.landing.h}
+              color="#8B5CF6" bgColor="rgba(139,92,246,0.08)"
+              active={activeNode === 'landing'} onClick={() => setActiveNode(activeNode === 'landing' ? null : 'landing')} />
 
               {/* Legend */}
               <g transform="translate(20, 470)">
